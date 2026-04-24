@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import io
 import json
-import os
+import queue
 import re
+import sys
 import datetime as dt
 import threading
 import time
 from pathlib import Path
-from tkinter import Tk, ttk, StringVar, Text, END, messagebox
+from tkinter import Tk, ttk, StringVar, Text, END, filedialog, messagebox
 import tkinter as tk
 
 import requests
@@ -26,6 +27,14 @@ try:
     HAS_PDFPLUMBER = True
 except ImportError:
     HAS_PDFPLUMBER = False
+
+try:
+    from pdfminer.high_level import extract_text as pdfminer_extract_text
+    HAS_PDFMINER = True
+except ImportError:
+    HAS_PDFMINER = False
+
+HAS_PDF_TEXT = HAS_PDFPLUMBER or HAS_PDFMINER
 
 # ─────────────────────── 상수 ───────────────────────
 
@@ -37,6 +46,10 @@ else:
     APP_DIR = Path(__file__).parent
 
 ISSUERS_PATH = APP_DIR / "issuers.json"
+SETTINGS_PATH = APP_DIR / "settings.json"
+DEFAULT_SAVE_ROOT = Path(
+    r"\\10.10.10.11\파생상품평가본부\B.구조화평가팀\2_Term Sheet 모음\금리구조화채권"
+)
 
 # 내장 기본 매핑 (prefix → DART 등록 회사명). 긴 prefix 우선.
 DEFAULT_ISSUERS = {
@@ -101,7 +114,8 @@ def save_user_issuers(user_dict):
     save_json(ISSUERS_PATH, cleaned)
 STATE_DIR = APP_DIR / "state"
 LOGO_PATH = BUNDLE_DIR / "kap_logo.png"
-DOWNLOADS = Path.home() / "Downloads"
+DOWNLOADS = DEFAULT_SAVE_ROOT
+JSON_LOAD_ERRORS = []
 
 # 파스텔 팔레트
 BG        = "#F5F0FA"   # 연보라
@@ -120,10 +134,19 @@ PDF_URL    = f"{DART_BASE}/pdf/download/pdf.do"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Origin": DART_BASE,
     "Referer": f"{DART_BASE}/dsab007/main.do",
+    "Cache-Control": "no-cache",
+    "Connection": "close",
 }
 SLEEP = 0.3
 SEARCH_DAYS = 90  # 텀싯/실적 검색 기간
+INDEX_SCAN_LIMIT = 80  # 인덱스 HTML은 가벼워서 넓게 확인
+PDF_SCAN_LIMIT = 80    # PDF 본문 스캔은 캐시를 사용해 반복 다운로드 방지
+REQUEST_RETRIES = 3
+RETRY_BACKOFF = 0.8
 
 # ─────────────────────── 유틸 ───────────────────────
 
@@ -131,13 +154,30 @@ def load_json(path, default=None):
     if path.exists():
         try:
             return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as e:
+            JSON_LOAD_ERRORS.append(f"{path}: {e}")
             return default
     return default
 
 def save_json(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def normalize_save_root(value=None):
+    text = str(value or "").strip().strip('"')
+    return Path(text) if text else DEFAULT_SAVE_ROOT
+
+def load_settings():
+    data = load_json(SETTINGS_PATH, {}) or {}
+    return {"save_root": str(normalize_save_root(data.get("save_root")))}
+
+def save_settings(settings):
+    root = normalize_save_root((settings or {}).get("save_root"))
+    save_json(SETTINGS_PATH, {"save_root": str(root)})
+    return root
+
+def get_save_root():
+    return normalize_save_root(load_settings().get("save_root"))
 
 def today_str():
     return dt.date.today().strftime("%Y%m%d")
@@ -150,6 +190,35 @@ def get_state():
 def safe_filename(s):
     return re.sub(r'[\\/:*?"<>|]', "_", s).strip()
 
+def unique_path(path):
+    """Avoid silently overwriting an existing downloaded PDF."""
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+    for i in range(1, 1000):
+        candidate = parent / f"{stem}_{i}{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"저장 파일명을 만들 수 없습니다: {path}")
+
+def stock_output_dir(save_root, stock_code):
+    root = normalize_save_root(save_root)
+    safe_code = safe_filename(stock_code).upper()
+    return root / safe_code if safe_code else root
+
+def output_pdf_path(save_root, stock_code, stock_name, suffix=""):
+    folder = stock_output_dir(save_root, stock_code)
+    folder.mkdir(parents=True, exist_ok=True)
+    safe_code = safe_filename(stock_code).upper()
+    safe_name = safe_filename(stock_name)
+    if safe_code:
+        fname = f"{safe_code}_{safe_name}{suffix}.pdf"
+    else:
+        fname = f"{safe_name}{suffix}.pdf"
+    return unique_path(folder / fname)
+
 # ─────────────────────── 입력 파싱 ───────────────────────
 
 def parse_input_line(line):
@@ -160,6 +229,30 @@ def parse_input_line(line):
     if len(parts) == 2:
         return parts[0], parts[1]
     return "", parts[0]
+
+def is_security_code(text):
+    return bool(re.fullmatch(r"[A-Z]{2}[A-Z0-9]{10}", text.strip(), re.I))
+
+def parse_input_lines(lines):
+    """
+    Accept both supported input layouts:
+    - one line: KR6HN0008746  하나증권(DLB)2681
+    - two lines: KR6HN0008746\n하나증권(DLB)2681
+    """
+    cleaned = [line.strip() for line in lines if line.strip()]
+    out = []
+    i = 0
+    while i < len(cleaned):
+        line = cleaned[i]
+        if is_security_code(line) and i + 1 < len(cleaned) and not is_security_code(cleaned[i + 1]):
+            out.append((line, cleaned[i + 1]))
+            i += 2
+            continue
+        parsed = parse_input_line(line)
+        if parsed:
+            out.append(parsed)
+        i += 1
+    return out
 
 def extract_round(stock_name):
     """종목명 끝의 회차. '134-1' 같은 세부회차도 통째 캡처."""
@@ -211,7 +304,7 @@ def round_in(text, full, base):
     if not full:
         return False
     t = re.sub(r"(?<=\d),(?=\d)", "", text)  # 매칭용으로만 쉼표 제거
-    if full in t:
+    if re.search(rf"(?<![\d\-]){re.escape(full)}(?!\d)", t):
         return True
     if base and base != full:
         # 앞: 숫자/하이픈 아닌 것,  뒤: 숫자 아닌 것 (하이픈 허용 → '280-1'도 OK)
@@ -223,14 +316,152 @@ def round_in(text, full, base):
 
 class Dart:
     def __init__(self):
-        self.s = requests.Session()
-        self.s.headers.update(HEADERS)
+        self._warmed = False
+        self.s = self._make_session()
+
+    def _make_session(self):
+        session = requests.Session()
+        session.trust_env = False
+        session.headers.update(HEADERS)
+        return session
+
+    def _reset_session(self):
+        try:
+            self.s.close()
+        except Exception:
+            pass
+        self._warmed = False
+        self.s = self._make_session()
+
+    def _warmup(self):
+        if self._warmed:
+            return
+        try:
+            r = self.s.request("GET", f"{DART_BASE}/dsab007/main.do", timeout=10)
+            r.raise_for_status()
+            self._warmed = True
+        except requests.RequestException:
+            self._reset_session()
+
+    def _request(self, method, url, **kwargs):
+        last_error = None
+        for attempt in range(REQUEST_RETRIES):
+            try:
+                r = self.s.request(method, url, **kwargs)
+                r.raise_for_status()
+                return r
+            except requests.RequestException as e:
+                last_error = e
+                self._reset_session()
+                if attempt < REQUEST_RETRIES - 1:
+                    if url != f"{DART_BASE}/dsab007/main.do":
+                        self._warmup()
+                    time.sleep(RETRY_BACKOFF * (attempt + 1))
+        raise last_error
+
+    @staticmethod
+    def _error_label(error):
+        name = type(error).__name__
+        text = str(error)
+        if "RemoteDisconnected" in text or "empty response" in text.lower():
+            return "서버가 응답 없이 연결을 끊었습니다"
+        if isinstance(error, requests.Timeout):
+            return "요청 시간이 초과되었습니다"
+        if isinstance(error, requests.SSLError):
+            return "TLS/인증서 연결 오류"
+        if isinstance(error, requests.ConnectionError):
+            return "연결 오류"
+        return f"{name}: {text}"
+
+    def check_status(self):
+        """Return DART service diagnostics without raising."""
+        checks = []
+
+        def add_check(name, method, url, **kwargs):
+            started = time.time()
+            try:
+                r = self._request(method, url, **kwargs)
+                elapsed = time.time() - started
+                checks.append({
+                    "name": name,
+                    "ok": True,
+                    "status": r.status_code,
+                    "detail": f"HTTP {r.status_code}, {len(r.content)} bytes, {elapsed:.1f}s",
+                })
+            except Exception as e:
+                elapsed = time.time() - started
+                checks.append({
+                    "name": name,
+                    "ok": False,
+                    "status": None,
+                    "detail": f"{self._error_label(e)} ({elapsed:.1f}s)",
+                })
+
+        add_check("DART 메인", "GET", f"{DART_BASE}/dsab007/main.do", timeout=10)
+        today = dt.date.today()
+        data = {
+            "currentPage": 1,
+            "maxResults": 10,
+            "sort": "date",
+            "series": "desc",
+            "startDate": (today - dt.timedelta(days=7)).strftime("%Y%m%d"),
+            "endDate": today.strftime("%Y%m%d"),
+            "pubStatus": "Y",
+            "textCrpNm": "메리츠증권",
+            "reportName": "",
+        }
+        add_check("DART 검색", "POST", SEARCH_URL, data=data, timeout=20)
+
+        ok = all(c["ok"] for c in checks)
+        summary = "정상" if ok else "장애 또는 접속 불가"
+        return {"ok": ok, "summary": summary, "checks": checks}
+
+    @staticmethod
+    def parse_search_results(html):
+        # 패턴: openReportViewer('rcpNo') ... >보고서명<
+        pairs = re.findall(
+            r"openReportViewer\(\s*['\"](\d{14})['\"][^>]*\)[^>]*>\s*([^<]+?)\s*<",
+            html,
+        )
+        if pairs:
+            return pairs
+        # fallback: rcpNo만
+        rcps = re.findall(r"\b(\d{14})\b", html)
+        return [(r, "") for r in rcps]
+
+    @staticmethod
+    def parse_doc_info(html):
+        dcm = None
+        for pattern in (
+            r"\bdcmNo\s*[:=]\s*['\"]?(\d{8})",
+            r"\bdcm_no\s*[:=]\s*['\"]?(\d{8})",
+            r"openPdfDownload\(\s*['\"]\d{14}['\"]\s*,\s*['\"](\d{8})",
+        ):
+            m = re.search(pattern, html)
+            if m:
+                dcm = m.group(1)
+                break
+        if not dcm:
+            nums = re.findall(r"'(\d{8})'", html)
+            dcm = next((n for n in nums if not n.startswith("00")), None)
+
+        # 문서 타이틀: .add('x','y','타이틀', ...) 패턴 우선
+        titles = re.findall(
+            r"\.add\(\s*['\"][^'\"]*['\"]\s*,\s*['\"][^'\"]*['\"]\s*,\s*['\"]([^'\"]+)['\"]",
+            html,
+        )
+        # fallback: 한글 포함 따옴표 문자열 (길이 8자 이상)
+        if not titles:
+            titles = [t for t in re.findall(r"['\"]([^'\"]{8,})['\"]", html)
+                      if re.search(r"[가-힣]", t)]
+        return dcm, titles
 
     def search(self, company, start, end, report_name="", page_size=100):
         """
         공시 검색 → [(rcp_no, title), ...]
         title은 검색 결과 행의 보고서명 텍스트.
         """
+        self._warmup()
         results = []
         page = 1
         while True:
@@ -246,21 +477,18 @@ class Dart:
                 "reportName": report_name,
             }
             try:
-                r = self.s.post(SEARCH_URL, data=data, timeout=20)
-                r.raise_for_status()
+                r = self._request("POST", SEARCH_URL, data=data, timeout=20)
             except Exception as e:
                 raise RuntimeError(f"검색 실패: {e}")
             html = r.text
-            # 패턴: openReportViewer('rcpNo') ... >보고서명<
-            pairs = re.findall(
-                r"openReportViewer\(\s*['\"](\d{14})['\"][^>]*\)[^>]*>\s*([^<]+?)\s*<",
-                html,
-            )
-            if not pairs:
-                # fallback: rcpNo만
-                rcps = re.findall(r"\b(\d{14})\b", html)
-                pairs = [(r, "") for r in rcps]
-            new = [p for p in pairs if p[0] not in {x[0] for x in results}]
+            pairs = self.parse_search_results(html)
+            seen = {x[0] for x in results}
+            new = []
+            for p in pairs:
+                if p[0] in seen:
+                    continue
+                new.append(p)
+                seen.add(p[0])
             if not new:
                 break
             results.extend(new)
@@ -280,35 +508,20 @@ class Dart:
         문서타이틀은 tree.add(...) 3번째 인자 등 인덱스에 표시되는 문서명.
         """
         try:
-            r = self.s.get(INDEX_URL, params={"rcpNo": rcp_no}, timeout=20)
-            r.raise_for_status()
+            r = self._request("GET", INDEX_URL, params={"rcpNo": rcp_no}, timeout=20)
         except Exception as e:
             raise RuntimeError(f"인덱스 실패: {e}")
         html = r.text
-
-        # dcm_no
-        nums = re.findall(r"'(\d{8})'", html)
-        dcm = next((n for n in nums if not n.startswith("00")), None)
-
-        # 문서 타이틀: .add('x','y','타이틀', ...) 패턴 우선
-        titles = re.findall(
-            r"\.add\(\s*['\"][^'\"]*['\"]\s*,\s*['\"][^'\"]*['\"]\s*,\s*['\"]([^'\"]+)['\"]",
-            html,
-        )
-        # fallback: 한글 포함 따옴표 문자열 (길이 8자 이상)
-        if not titles:
-            titles = [t for t in re.findall(r"['\"]([^'\"]{8,})['\"]", html)
-                      if re.search(r"[가-힣]", t)]
-        return dcm, titles
+        return self.parse_doc_info(html)
 
     def download_pdf(self, rcp_no, dcm_no):
         try:
-            r = self.s.get(
+            r = self._request(
+                "GET",
                 PDF_URL,
                 params={"rcp_no": rcp_no, "dcm_no": dcm_no},
                 timeout=120,
             )
-            r.raise_for_status()
         except Exception as e:
             raise RuntimeError(f"PDF 다운 실패: {e}")
         if not r.content.startswith(b"%PDF"):
@@ -350,13 +563,20 @@ def termsheet_candidates(pairs, product):
 
 def pdf_front_text(pdf_bytes, max_pages=5):
     """PDF 앞쪽 max_pages 페이지 텍스트 추출 (회차 검색용)."""
-    if not HAS_PDFPLUMBER:
+    if not HAS_PDF_TEXT:
         return ""
-    try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            return "\n".join((p.extract_text() or "") for p in pdf.pages[:max_pages])
-    except Exception:
-        return ""
+    if HAS_PDFPLUMBER:
+        try:
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                return "\n".join((p.extract_text() or "") for p in pdf.pages[:max_pages])
+        except Exception:
+            pass
+    if HAS_PDFMINER:
+        try:
+            return pdfminer_extract_text(io.BytesIO(pdf_bytes), maxpages=max_pages) or ""
+        except Exception:
+            return ""
+    return ""
 
 def match_termsheet(pairs, round_full, round_base, product):
     """
@@ -401,7 +621,8 @@ def match_result(pairs, round_full, round_base):
     if round_full:
         f = [c for c in cand if round_in(c[1], round_full, round_base)]
         if f:
-            cand = f
+            return f[0]
+        return (None, None)
     return cand[0] if cand else (None, None)
 
 # ─────────────────────── 발행실적 PDF 분석 ───────────────────────
@@ -411,13 +632,11 @@ def analyze_result_pdf(pdf_bytes):
     반환: (status, label, reason)
     status ∈ {'cancelled','issued','unknown'}
     """
-    if not HAS_PDFPLUMBER:
-        return ("unknown", "알 수 없음", "pdfplumber 미설치")
-    try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            text = "\n".join((p.extract_text() or "") for p in pdf.pages[:5])
-    except Exception as e:
-        return ("unknown", "알 수 없음", f"PDF 파싱 실패: {e}")
+    if not HAS_PDF_TEXT:
+        return ("unknown", "알 수 없음", "PDF 텍스트 추출 엔진 미설치")
+    text = pdf_front_text(pdf_bytes, max_pages=5)
+    if not text:
+        return ("unknown", "알 수 없음", "PDF 파싱 실패")
 
     if "발행이 취소" in text or "발행취소" in text:
         return ("cancelled", "발행취소", "본문에 '발행취소'")
@@ -563,9 +782,17 @@ class App:
         root.title("DART 텀싯 자동 다운로더")
         root.geometry("840x660")
 
+        self._main_thread_id = threading.get_ident()
+        self._ui_queue = queue.Queue()
         self.issuers = load_issuers()
+        self.save_root_var = StringVar(value=str(get_save_root()))
         self.dart = Dart()
         self._build_ui()
+        for err in JSON_LOAD_ERRORS:
+            self.log(f"[경고] JSON 파일을 읽지 못했습니다: {err}")
+        if not HAS_PDF_TEXT:
+            self.log("[경고] PDF 텍스트 추출 엔진이 없어 PDF 본문 스캔과 발행취소 판정이 제한됩니다.")
+        self.root.after(50, self._drain_ui_queue)
 
     def _build_ui(self):
         self.root.configure(bg=BG)
@@ -642,11 +869,24 @@ class App:
                  font=("맑은 고딕", 9), justify="left",
                  anchor="w").pack(fill="x", pady=(0, 8))
 
+        save_row = tk.Frame(body, bg=BG)
+        save_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(save_row, text="저장 폴더").pack(side="left", padx=(0, 8))
+        self.save_root_entry = ttk.Entry(save_row, textvariable=self.save_root_var)
+        self.save_root_entry.pack(side="left", fill="x", expand=True)
+        self.save_root_entry.bind("<Return>", lambda _e: self.save_root_setting())
+        ttk.Button(save_row, text="폴더 선택", style="Ghost.TButton",
+                   command=self.choose_save_root).pack(side="left", padx=(8, 0))
+        ttk.Button(save_row, text="설정 저장", style="Ghost.TButton",
+                   command=self.save_root_setting).pack(side="left", padx=(6, 0))
+
         btns = tk.Frame(body, bg=BG)
         btns.pack(fill="x")
         ttk.Button(btns, text="① 텀싯 다운로드", command=self.run_download).pack(side="left")
         ttk.Button(btns, text="② 발행취소 확인 (전체)", style="Ghost.TButton",
                    command=self.run_check).pack(side="left", padx=8)
+        ttk.Button(btns, text="DART 상태 확인", style="Ghost.TButton",
+                   command=self.run_status_check).pack(side="left")
         ttk.Button(btns, text="오늘 검색 목록", style="Ghost.TButton",
                    command=self.show_today).pack(side="right")
 
@@ -657,16 +897,75 @@ class App:
                             padx=10, pady=8)
         self.log_txt.pack(fill="both", expand=True, pady=(0, 10))
 
-        self.status = StringVar(value=f"저장 경로: {DOWNLOADS}")
+        self.status = StringVar()
+        self._update_save_status()
         tk.Label(self.root, textvariable=self.status, anchor="w",
                  bg="#EDE4FA", fg=MUTED, padx=12, pady=5,
                  font=("맑은 고딕", 9)).pack(fill="x", side="bottom")
 
-    def log(self, msg):
+    def current_save_root(self):
+        return normalize_save_root(self.save_root_var.get())
+
+    def _update_save_status(self):
+        self.status.set(f"저장 경로: {self.current_save_root()}\\종목코드")
+
+    def choose_save_root(self):
+        current = self.current_save_root()
+        try:
+            initial_dir = str(current if current.exists() else Path.home())
+        except OSError:
+            initial_dir = str(Path.home())
+        selected = filedialog.askdirectory(
+            title="저장 폴더 선택",
+            initialdir=initial_dir,
+            parent=self.root,
+        )
+        if selected:
+            self.save_root_var.set(selected)
+            self.save_root_setting(show_message=False)
+
+    def save_root_setting(self, show_message=True):
+        root = self.current_save_root()
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            save_settings({"save_root": str(root)})
+        except Exception as e:
+            messagebox.showerror("저장 경로 오류", f"저장 폴더를 사용할 수 없습니다.\n\n{root}\n\n{e}")
+            return False
+        self._update_save_status()
+        if show_message:
+            messagebox.showinfo("설정 저장", f"저장 폴더가 저장되었습니다.\n\n{root}")
+        return True
+
+    def _run_on_ui_thread(self, func, *args, **kwargs):
+        if threading.get_ident() == self._main_thread_id:
+            return func(*args, **kwargs)
+        self._ui_queue.put((func, args, kwargs))
+        return None
+
+    def _drain_ui_queue(self):
+        while True:
+            try:
+                func, args, kwargs = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                func(*args, **kwargs)
+            except tk.TclError:
+                return
+        try:
+            self.root.after(50, self._drain_ui_queue)
+        except tk.TclError:
+            return
+
+    def _log(self, msg):
         ts = dt.datetime.now().strftime("%H:%M:%S")
         self.log_txt.insert(END, f"[{ts}] {msg}\n")
         self.log_txt.see(END)
         self.root.update_idletasks()
+
+    def log(self, msg):
+        self._run_on_ui_thread(self._log, msg)
 
     def edit_issuers(self):
         IssuerEditor(self.root, self)
@@ -680,29 +979,75 @@ class App:
         msg = "\n".join(f"• [{i['stock_code']}] {i['stock_name']}" for i in items)
         messagebox.showinfo(f"오늘 검색 목록 ({len(items)}건)", msg)
 
+    def run_status_check(self):
+        threading.Thread(target=self._status_worker, daemon=True).start()
+
+    def _status_worker(self):
+        self.log("=== DART 상태 확인 ===")
+        status = self.dart.check_status()
+        lines = [f"DART 상태: {status['summary']}"]
+        for check in status["checks"]:
+            mark = "OK" if check["ok"] else "FAIL"
+            line = f"{mark} {check['name']}: {check['detail']}"
+            lines.append(line)
+            self.log(f"   {line}")
+        msg = "\n".join(lines)
+        self._run_on_ui_thread(messagebox.showinfo, "DART 상태 확인", msg)
+
     # ─── 텀싯 다운로드 ───
 
     def run_download(self):
-        lines = [l for l in self.input_txt.get("1.0", END).splitlines() if l.strip()]
-        if not lines:
+        records = parse_input_lines(self.input_txt.get("1.0", END).splitlines())
+        if not records:
             messagebox.showwarning("입력 없음", "종목을 입력하세요.")
             return
-        threading.Thread(target=self._download_worker, args=(lines,), daemon=True).start()
+        if not self.save_root_setting(show_message=False):
+            return
+        save_root = self.current_save_root()
+        threading.Thread(target=self._download_worker, args=(records, save_root), daemon=True).start()
 
-    def _download_worker(self, lines):
-        self.log(f"=== 텀싯 다운로드 시작 ({len(lines)}건) ===")
+    def _download_worker(self, records, save_root):
+        self.log(f"=== 텀싯 다운로드 시작 ({len(records)}건) ===")
+        self.log(f"   저장 루트: {save_root}")
         completed = []   # 다운로드 성공 항목
         failed = []      # (stock_name, reason)
         today = dt.date.today()
         start = (today - dt.timedelta(days=SEARCH_DAYS)).strftime("%Y%m%d")
         end = today.strftime("%Y%m%d")
         state_path, state = get_state()
+        search_cache = {}
+        doc_cache = {}
+        pdf_cache = {}
+        front_text_cache = {}
 
-        for line in lines:
-            parsed = parse_input_line(line)
-            if not parsed:
-                continue
-            stock_code, stock_name = parsed
+        def cached_search(issuer):
+            key = (issuer, start, end)
+            if key not in search_cache:
+                search_cache[key] = self.dart.search(issuer, start, end, report_name="")
+                time.sleep(SLEEP)
+            return search_cache[key]
+
+        def cached_doc_info(rcp_no):
+            if rcp_no not in doc_cache:
+                doc_cache[rcp_no] = self.dart.get_doc_info(rcp_no)
+                time.sleep(SLEEP)
+            return doc_cache[rcp_no]
+
+        def cached_pdf(rcp_no, dcm_no):
+            key = (rcp_no, dcm_no)
+            if key not in pdf_cache:
+                pdf_cache[key] = self.dart.download_pdf(rcp_no, dcm_no)
+                time.sleep(SLEEP)
+            return pdf_cache[key]
+
+        def cached_front_text(rcp_no, dcm_no):
+            key = (rcp_no, dcm_no)
+            if key not in front_text_cache:
+                pdf = cached_pdf(rcp_no, dcm_no)
+                front_text_cache[key] = pdf_front_text(pdf, max_pages=5) if pdf else ""
+            return front_text_cache[key]
+
+        for stock_code, stock_name in records:
             self.log(f"→ [{stock_code}] {stock_name}")
 
             issuer, mapped = find_issuer(stock_name, self.issuers)
@@ -718,28 +1063,27 @@ class App:
             self.log(f"   발행사={issuer}{tag}, 회차={rfull or '미상'}, 유형={product or '미상'}")
 
             try:
-                pairs = self.dart.search(issuer, start, end, report_name="")
+                pairs = cached_search(issuer)
             except Exception as e:
                 self.log(f"   [오류] {e}")
                 failed.append((stock_name, str(e)))
                 continue
-            time.sleep(SLEEP)
             self.log(f"   검색 결과 {len(pairs)}건")
 
             rcp, title, fb = match_termsheet(pairs, rfull, rbase, product)
             pdf = None  # 본문 fallback에서 재사용 가능
 
             if not rcp:
-                cands = termsheet_candidates(pairs, product)[:15]
+                cands = termsheet_candidates(pairs, product)
 
                 # ── 1차: 인덱스 HTML만 조회해서 문서타이틀에서 회차 매칭 (PDF 다운로드 없음)
                 hit_by_index = None  # (c_rcp, c_title, dcm)
-                if cands:
-                    self.log(f"   타이틀 매칭 실패 → 인덱스 조회 ({len(cands)}건 스캔)")
-                for c_rcp, c_title, _pri in cands:
+                index_cands = cands[:INDEX_SCAN_LIMIT]
+                if index_cands:
+                    self.log(f"   타이틀 매칭 실패 → 인덱스 조회 ({len(index_cands)}건 스캔)")
+                for c_rcp, c_title, _pri in index_cands:
                     try:
-                        dcm, titles = self.dart.get_doc_info(c_rcp)
-                        time.sleep(SLEEP)
+                        dcm, titles = cached_doc_info(c_rcp)
                     except Exception:
                         continue
                     if any(round_in(t, rfull, rbase) for t in titles):
@@ -750,8 +1094,7 @@ class App:
                 if hit_by_index:
                     rcp, title, saved_dcm = hit_by_index
                     try:
-                        pdf = self.dart.download_pdf(rcp, saved_dcm)
-                        time.sleep(SLEEP)
+                        pdf = cached_pdf(rcp, saved_dcm)
                     except Exception as e:
                         self.log(f"   [오류] PDF 다운 실패: {e}")
                         failed.append((stock_name, str(e)))
@@ -759,19 +1102,17 @@ class App:
                 else:
                     # ── 2차: PDF 본문 1~5페이지 확인 (최후수단)
                     self.log(f"   인덱스 매칭 실패 → PDF 본문 스캔")
-                    for c_rcp, c_title, _pri in cands:
+                    for c_rcp, c_title, _pri in cands[:PDF_SCAN_LIMIT]:
                         try:
-                            dcm = self.dart.get_dcm_no(c_rcp)
-                            time.sleep(SLEEP)
+                            dcm, _titles = cached_doc_info(c_rcp)
                             if not dcm:
                                 continue
-                            cand_pdf = self.dart.download_pdf(c_rcp, dcm)
-                            time.sleep(SLEEP)
+                            cand_pdf = cached_pdf(c_rcp, dcm)
                         except Exception:
                             continue
                         if not cand_pdf:
                             continue
-                        body = pdf_front_text(cand_pdf, max_pages=5)
+                        body = cached_front_text(c_rcp, dcm)
                         if round_in(body, rfull, rbase):
                             rcp, title, pdf = c_rcp, c_title, cand_pdf
                             self.log(f"   본문 매칭: {title} (rcp={rcp})")
@@ -789,14 +1130,12 @@ class App:
             # PDF 다운로드 (본문 fallback이면 이미 받아둔 것 재사용)
             if pdf is None:
                 try:
-                    dcm = self.dart.get_dcm_no(rcp)
-                    time.sleep(SLEEP)
+                    dcm, _titles = cached_doc_info(rcp)
                     if not dcm:
                         self.log(f"   [오류] dcm_no 없음")
                         failed.append((stock_name, "dcm_no 없음"))
                         continue
-                    pdf = self.dart.download_pdf(rcp, dcm)
-                    time.sleep(SLEEP)
+                    pdf = cached_pdf(rcp, dcm)
                 except Exception as e:
                     self.log(f"   [오류] {e}")
                     failed.append((stock_name, str(e)))
@@ -806,10 +1145,13 @@ class App:
                 failed.append((stock_name, "PDF 응답 비정상"))
                 continue
 
-            fname = f"{stock_code}_{safe_filename(stock_name)}.pdf" \
-                    if stock_code else f"{safe_filename(stock_name)}.pdf"
-            out = DOWNLOADS / fname
-            out.write_bytes(pdf)
+            try:
+                out = output_pdf_path(save_root, stock_code, stock_name)
+                out.write_bytes(pdf)
+            except Exception as e:
+                self.log(f"   [오류] 저장 실패: {e}")
+                failed.append((stock_name, f"저장 실패: {e}"))
+                continue
             self.log(f"   저장: {out}")
 
             entry = {
@@ -826,7 +1168,7 @@ class App:
             completed.append(entry)
 
         self.log("=== 완료 ===")
-        self.root.after(0, lambda: self._show_result_popup(completed, failed))
+        self._run_on_ui_thread(self._show_result_popup, completed, failed)
 
     # ─── 결과 팝업 ───
 
@@ -890,9 +1232,12 @@ class App:
                 messagebox.showinfo("선택 없음", "발행실적을 확인할 종목을 체크하세요.", parent=win)
                 return
             save_pdf = save_var.get()
+            if save_pdf and not self.save_root_setting(show_message=False):
+                return
+            save_root = self.current_save_root()
             win.destroy()
             threading.Thread(target=self._check_worker,
-                             args=(selected, save_pdf), daemon=True).start()
+                             args=(selected, save_pdf, save_root), daemon=True).start()
 
         save_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(footer, text="발행실적보고서 PDF도 저장",
@@ -914,10 +1259,14 @@ class App:
         save = messagebox.askyesno("발행취소 확인",
                                     f"오늘 검색한 {len(items)}건 전체를 확인합니다.\n"
                                     "발행실적보고서 PDF도 저장하시겠습니까?")
+        if save and not self.save_root_setting(show_message=False):
+            return
+        save_root = self.current_save_root()
         threading.Thread(target=self._check_worker,
-                         args=(items, save), daemon=True).start()
+                         args=(items, save, save_root), daemon=True).start()
 
-    def _check_worker(self, items=None, save_pdf=False):
+    def _check_worker(self, items=None, save_pdf=False, save_root=None):
+        save_root = normalize_save_root(save_root)
         if items is None:
             _, state = get_state()
             items = state.get("searched", [])
@@ -971,9 +1320,12 @@ class App:
             self.log(f"   {label} ({reason})")
 
             if save_pdf:
-                fname = f"{item['stock_code']}_{safe_filename(name)}_발행실적.pdf"
-                (DOWNLOADS / fname).write_bytes(pdf)
-                self.log(f"   보고서 저장: {DOWNLOADS / fname}")
+                try:
+                    out = output_pdf_path(save_root, item.get("stock_code", ""), name, suffix="_발행실적")
+                    out.write_bytes(pdf)
+                    self.log(f"   보고서 저장: {out}")
+                except Exception as e:
+                    self.log(f"   [오류] 보고서 저장 실패: {e}")
 
             results.append((name, status, label, reason))
 
@@ -991,7 +1343,7 @@ class App:
         for n, _, l, r in issued:
             msg += f"  ✓ {n} — {r}\n"
         self.log(msg)
-        messagebox.showinfo("발행 확인 결과", msg)
+        self._run_on_ui_thread(messagebox.showinfo, "발행 확인 결과", msg)
 
 
 def main():

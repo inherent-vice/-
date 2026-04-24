@@ -1,6 +1,10 @@
 # User/runtime state
 state/
 issuers.json
+settings.json
+e2e_output/
+.pip-cache/
+.pip-temp/
 
 # Python
 __pycache__/
