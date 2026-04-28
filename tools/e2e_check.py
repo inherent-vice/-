@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import sys
-import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,6 +10,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import dart_auto as d
+from dart_app.services.document_access import DartDocumentAccess
 
 
 DEFAULT_INPUT = """\
@@ -25,80 +25,77 @@ KR6MZ0005MY4
 """
 
 
-def find_termsheet(client, pairs, round_full, round_base, product, doc_cache, pdf_cache, text_cache):
-    def doc_info(rcp_no):
-        if rcp_no not in doc_cache:
-            doc_cache[rcp_no] = client.get_doc_info(rcp_no)
-            time.sleep(d.SLEEP)
-        return doc_cache[rcp_no]
-
-    def pdf_for(rcp_no, dcm_no):
-        key = (rcp_no, dcm_no)
-        if key not in pdf_cache:
-            pdf_cache[key] = client.download_pdf(rcp_no, dcm_no)
-            time.sleep(d.SLEEP)
-        return pdf_cache[key]
-
-    def front_text(rcp_no, dcm_no):
-        key = (rcp_no, dcm_no)
-        if key not in text_cache:
-            pdf = pdf_for(rcp_no, dcm_no)
-            text_cache[key] = d.pdf_front_text(pdf, max_pages=5) if pdf else ""
-        return text_cache[key]
-
-    rcp, title, _fb = d.match_termsheet(pairs, round_full, round_base, product)
-    pdf = None
-    dcm = None
-    if rcp:
-        dcm, _titles = doc_info(rcp)
-        if dcm:
-            pdf = pdf_for(rcp, dcm)
-        return rcp, title, dcm, pdf, "title"
-
-    cands = d.termsheet_candidates(pairs, product)
-
-    for c_rcp, c_title, _pri in cands[:d.INDEX_SCAN_LIMIT]:
-        c_dcm, titles = doc_info(c_rcp)
-        if any(d.round_in(t, round_full, round_base) for t in titles):
-            pdf = pdf_for(c_rcp, c_dcm) if c_dcm else None
-            return c_rcp, c_title, c_dcm, pdf, "index"
-
-    for c_rcp, c_title, _pri in cands[:d.PDF_SCAN_LIMIT]:
-        c_dcm, _titles = doc_info(c_rcp)
-        if not c_dcm:
-            continue
-        cand_pdf = pdf_for(c_rcp, c_dcm)
-        if cand_pdf and d.round_in(front_text(c_rcp, c_dcm), round_full, round_base):
-            return c_rcp, c_title, c_dcm, cand_pdf, "pdf"
-
-    return None, None, None, None, "not_found"
+def find_termsheet(
+    access,
+    pairs,
+    round_full,
+    round_base,
+    product,
+    stock_code,
+    stock_name,
+):
+    match = d.find_termsheet_document(
+        pairs,
+        round_full,
+        round_base,
+        product,
+        access.doc_info,
+        access.pdf_for,
+        access.front_text,
+        get_document_text=access.document_text_callback(),
+        stock_code=stock_code,
+        stock_name=stock_name,
+    )
+    return match.rcp_no, match.title, match.dcm_no, match.pdf, match.source
 
 
-def find_result_report(client, pairs, stock_name):
+def find_result_report(
+    access,
+    pairs,
+    stock_code,
+    stock_name,
+):
     round_full, round_base = d.extract_round(stock_name)
-    rcp, title = d.match_result(pairs, round_full, round_base)
-    if not rcp:
-        return None, None, None, None, ("unknown", "알 수 없음", "발행실적보고서 미게재")
-    dcm = client.get_dcm_no(rcp)
-    if not dcm:
-        return rcp, title, None, None, ("unknown", "알 수 없음", "dcm_no 없음")
-    pdf = client.download_pdf(rcp, dcm)
-    if not pdf:
-        return rcp, title, dcm, None, ("unknown", "알 수 없음", "PDF 응답 비정상")
-    return rcp, title, dcm, pdf, d.analyze_result_pdf(pdf)
+    product = d.extract_product_type(stock_name)
+
+    match = d.find_result_report_document(
+        pairs,
+        round_full,
+        round_base,
+        access.doc_info,
+        access.pdf_for,
+        access.front_text,
+        get_document_text=access.document_text_callback(),
+        stock_code=stock_code,
+        stock_name=stock_name,
+        product=product,
+        need_pdf=True,
+    )
+    if not match.rcp_no:
+        analysis = d.ResultAnalysis(
+            "unknown",
+            "알 수 없음",
+            "낮음",
+            match.error or "발행실적보고서 미게재",
+            [match.error or "발행실적보고서 미게재"],
+            [],
+        )
+        return None, None, None, None, analysis
+    if match.error:
+        analysis = d.ResultAnalysis("unknown", "알 수 없음", "낮음", match.error, [match.error], [])
+        return match.rcp_no, match.title, match.dcm_no, match.pdf, analysis
+    return match.rcp_no, match.title, match.dcm_no, match.pdf, d.analyze_result_text(match.text)
 
 
 def run_e2e(input_text, output_dir):
     records = d.parse_input_lines(input_text.splitlines())
     output_dir.mkdir(parents=True, exist_ok=True)
     client = d.Dart()
+    access = DartDocumentAccess(client, delay_seconds=d.SLEEP)
     today = dt.date.today()
     start = (today - dt.timedelta(days=d.SEARCH_DAYS)).strftime("%Y%m%d")
     end = today.strftime("%Y%m%d")
     search_cache = {}
-    doc_cache = {}
-    pdf_cache = {}
-    text_cache = {}
     failures = 0
 
     print(f"records={len(records)} output={output_dir}")
@@ -120,7 +117,13 @@ def run_e2e(input_text, output_dir):
             print(f"search_results={len(pairs)}")
 
             rcp, title, dcm, pdf, source = find_termsheet(
-                client, pairs, round_full, round_base, product, doc_cache, pdf_cache, text_cache
+                access,
+                pairs,
+                round_full,
+                round_base,
+                product,
+                stock_code,
+                stock_name,
             )
             if not pdf:
                 print(f"FAIL termsheet source={source} rcp={rcp} title={title}")
@@ -130,10 +133,18 @@ def run_e2e(input_text, output_dir):
             out.write_bytes(pdf)
             print(f"OK termsheet source={source} rcp={rcp} dcm={dcm} file={out}")
 
-            rr_rcp, rr_title, rr_dcm, rr_pdf, status = find_result_report(client, pairs, stock_name)
-            label = status[1]
-            reason = status[2]
-            print(f"result_report status={label} reason={reason} rcp={rr_rcp} dcm={rr_dcm}")
+            rr_rcp, rr_title, rr_dcm, rr_pdf, status = find_result_report(
+                access,
+                pairs,
+                stock_code,
+                stock_name,
+            )
+            print(
+                f"result_report status={status.label} confidence={status.confidence} "
+                f"reason={status.reason} rcp={rr_rcp} dcm={rr_dcm}"
+            )
+            for evidence in status.evidence[:3]:
+                print(f"result_evidence={evidence}")
             if rr_pdf:
                 rr_out = d.output_pdf_path(output_dir, stock_code, stock_name, suffix="_발행실적")
                 rr_out.write_bytes(rr_pdf)

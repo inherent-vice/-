@@ -2,25 +2,55 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Behavioral guidelines (Karpathy)
+## Behavioral Guidelines (Karpathy-Inspired)
 
-Bias toward caution over speed. For trivial edits, use judgment.
+Based on `forrestchang/andrej-karpathy-skills`. These rules are meant to reduce common LLM coding mistakes. They bias toward caution over speed; use judgment for trivial one-line edits.
 
-**Think before coding.** State assumptions explicitly. If multiple interpretations exist, present them — don't pick silently. If a simpler approach exists, say so. When unclear, stop and ask.
+### 1. Think Before Coding
 
-**Simplicity first.** Write the minimum code that solves the problem. No speculative features. No abstractions for single-use code. No configurability that wasn't requested. No error handling for impossible scenarios. If 200 lines could be 50, rewrite.
+Do not assume, hide confusion, or silently choose between plausible interpretations.
 
-**Surgical changes.** Touch only what the request requires. Don't "improve" adjacent code, comments, or formatting. Don't refactor things that aren't broken. Match existing style. Mention unrelated dead code — don't delete it unless asked. Remove imports/variables only when *your* changes orphaned them. Every changed line should trace directly to the user's request.
+- State assumptions explicitly before implementing.
+- If multiple interpretations exist, present them and ask when the choice matters.
+- If a simpler approach exists, say so and explain the tradeoff.
+- If something is unclear, stop, name the ambiguity, and ask.
 
-**Goal-driven execution.** Define verifiable success criteria before starting.
-- "Add validation" → "Write tests for invalid inputs, then make them pass"
-- "Fix the bug" → "Write a test that reproduces it, then make it pass"
-- "Refactor X" → "Ensure tests pass before and after"
+### 2. Simplicity First
 
-For multi-step tasks, state a brief plan:
-```
-1. [Step] → verify: [check]
-2. [Step] → verify: [check]
+Write the minimum code that solves the requested problem.
+
+- Do not add features beyond what was asked.
+- Do not add abstractions for single-use code.
+- Do not add configurability that was not requested.
+- Do not add error handling for impossible scenarios.
+- If a solution is growing from 50 lines to 200 lines, simplify before continuing.
+
+### 3. Surgical Changes
+
+Touch only what the request requires and clean up only the side effects of your own changes.
+
+- Do not improve adjacent code, comments, or formatting opportunistically.
+- Do not refactor code that is not broken.
+- Match existing style, even if you would normally choose another style.
+- Mention unrelated dead code or cleanup opportunities; do not delete them unless asked.
+- Remove imports, variables, or functions only when your change made them unused.
+
+Every changed line should trace directly to the user's request.
+
+### 4. Goal-Driven Execution
+
+Define verifiable success criteria and loop until they are met.
+
+- For validation work, write or identify invalid-input checks, then make them pass.
+- For bug fixes, reproduce the bug with a test or focused check, then fix it.
+- For refactors, verify behavior before and after the change when practical.
+
+For multi-step tasks, state a short plan with checks:
+
+```text
+1. [Step] -> verify: [check]
+2. [Step] -> verify: [check]
+3. [Step] -> verify: [check]
 ```
 
 ## Project purpose

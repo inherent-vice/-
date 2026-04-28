@@ -3,6 +3,7 @@ state/
 issuers.json
 settings.json
 e2e_output/
+cache/
 .pip-cache/
 .pip-temp/
 

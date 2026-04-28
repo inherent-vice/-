@@ -1,39 +1,80 @@
 # Repository Guidelines
 
+## Agent Behavioral Guidelines (Karpathy-Inspired)
+
+Based on `forrestchang/andrej-karpathy-skills`. These rules are meant to reduce common LLM coding mistakes. They bias toward caution over speed; use judgment for trivial one-line edits.
+
+### 1. Think Before Coding
+
+Do not assume, hide confusion, or silently choose between plausible interpretations.
+
+- State assumptions explicitly before implementing.
+- If multiple interpretations exist, present them and ask when the choice matters.
+- If a simpler approach exists, say so and explain the tradeoff.
+- If something is unclear, stop, name the ambiguity, and ask.
+
+### 2. Simplicity First
+
+Write the minimum code that solves the requested problem.
+
+- Do not add features beyond what was asked.
+- Do not add abstractions for single-use code.
+- Do not add configurability that was not requested.
+- Do not add error handling for impossible scenarios.
+- If a solution is growing from 50 lines to 200 lines, simplify before continuing.
+
+### 3. Surgical Changes
+
+Touch only what the request requires and clean up only the side effects of your own changes.
+
+- Do not improve adjacent code, comments, or formatting opportunistically.
+- Do not refactor code that is not broken.
+- Match existing style, even if you would normally choose another style.
+- Mention unrelated dead code or cleanup opportunities; do not delete them unless asked.
+- Remove imports, variables, or functions only when your change made them unused.
+
+Every changed line should trace directly to the user's request.
+
+### 4. Goal-Driven Execution
+
+Define verifiable success criteria and loop until they are met.
+
+- For validation work, write or identify invalid-input checks, then make them pass.
+- For bug fixes, reproduce the bug with a test or focused check, then fix it.
+- For refactors, verify behavior before and after the change when practical.
+
+For multi-step tasks, state a short plan with checks:
+
+```text
+1. [Step] -> verify: [check]
+2. [Step] -> verify: [check]
+3. [Step] -> verify: [check]
+```
+
 ## Project Structure & Module Organization
 
-This repository is a compact Windows desktop utility for downloading DART termsheet and issuance-result PDFs. The main application lives in `dart_auto.py`; keep source changes there unless a requested change clearly needs a new module. Static GUI assets are `kap_logo.png` and `dart_icon.ico`. Tests live under `tests/`. Runtime user data is intentionally untracked: `issuers.json` stores user issuer overrides, `settings.json` stores the save root, and `state/YYYYMMDD.json` stores daily search history. Downloads are saved under the configured root using the stock code as a folder name, for example `...\금리구조화채권\KR6MZ0005MV0\...pdf`.
+This is a Python/Tkinter desktop utility for finding and downloading DART termsheet and issuance-result PDFs. `dart_auto.py` is a backward-compatible entry point; application code lives in `dart_app/`. Keep business logic in `dart_app/domain/`, DART and OpenDART clients in `dart_app/integrations/`, GUI code in `dart_app/ui/`, reusable file/PDF/text helpers in `dart_app/utils/`, and settings/state helpers in `dart_app/state.py`, `config.py`, and `runtime.py`. Unit tests are in `tests/`, with the current suite in `tests/test_matching.py`. Real-network verification lives in `tools/e2e_check.py`. Root assets include `kap_logo.png` and `dart_icon.ico`. Runtime output such as `cache/`, `state/`, `settings.json`, `issuers.json`, and `e2e_output/` should stay untracked.
 
 ## Build, Test, and Development Commands
 
-- `python dart_auto.py`: run the Tkinter GUI locally.
-- `python -B -c "src=open('dart_auto.py', encoding='utf-8').read(); compile(src, 'dart_auto.py', 'exec')"`: syntax-check without writing `.pyc` files.
-- `python -B -m unittest discover -s tests`: run the unit tests.
-- `python -B tools/e2e_check.py`: run the real DART end-to-end check for the Meritz DLB sample.
-- `python -m pip install requests pdfplumber pyinstaller`: install expected runtime/build dependencies.
-- Build from a non-Korean path, then copy the artifacts and run:
-
-```powershell
-python -m PyInstaller --onefile --windowed --noconfirm `
-  --icon dart_icon.ico `
-  --name "DART_텀싯다운로더" `
-  --add-data "kap_logo.png;." `
-  dart_auto.py
-```
+- `python -m pip install -r requirements.txt`: install runtime and packaging dependencies.
+- `python dart_auto.py`: launch the local Tkinter app.
+- `python -B -m unittest discover -s tests`: run unit tests without writing `.pyc` files.
+- `python -B tools/e2e_check.py`: run the DART end-to-end check and write sample downloads to `e2e_output/`.
+- `python -m PyInstaller --onefile --windowed --icon dart_icon.ico --add-data "kap_logo.png;." dart_auto.py`: build a Windows executable.
 
 ## Coding Style & Naming Conventions
 
-Use Python 3, 4-space indentation, and UTF-8 source text. Follow the existing procedural style: small parsing helpers at module level, DART networking in `Dart`, GUI behavior in `App` and `IssuerEditor`. Prefer explicit names such as `round_full`, `round_base`, `stock_name`, and `issuer`. Keep Korean UI strings readable and do not convert them to escaped text.
+Use Python 3, 4-space indentation, UTF-8 source files, and `snake_case` for functions, variables, and modules. Use `PascalCase` for classes such as `Dart`, `OpenDart`, and `App`. Prefer small pure helpers in `dart_app/domain/`; keep Tkinter event handling and layout inside `dart_app/ui/`. Preserve the `dart_auto` compatibility surface when moving functions, because tests and tools import and patch `dart_auto` globals. Keep Korean UI/report strings readable and do not replace them with escaped text.
 
 ## Testing Guidelines
 
-For logic changes, add focused tests for pure helpers such as `extract_round()`, `find_issuer()`, `round_in()`, `match_termsheet()`, and `match_result()`. Name tests `test_<function>_<case>.py` under `tests/`. Manual verification should include at least one DLB/ELB case, one DLS/ELS case, and one 신종/후순위 case.
+The project uses `unittest`. Name test files `test_<area>.py` and test methods `test_<behavior>`. Add focused tests for parsing, matching, result analysis, path generation, cache behavior, and settings normalization. Mock HTTP and PDF inputs in unit tests; reserve live DART access for `tools/e2e_check.py`. Run `python -B -m unittest discover -s tests` before opening a PR.
 
 ## Commit & Pull Request Guidelines
 
-The current history uses a simple Conventional Commit style, for example `chore: initial commit — DART termsheet downloader GUI`. Continue with concise prefixes such as `fix:`, `feat:`, `docs:`, and `chore:`. Pull requests should explain the user-facing behavior, list manual verification steps, and include screenshots when GUI layout changes.
+Recent history uses concise Conventional Commit prefixes, for example `feat: improve DART download workflow` and `chore: initial commit`. Continue with `feat:`, `fix:`, `docs:`, `test:`, or `chore:`. Pull requests should describe user-visible behavior, list test or e2e commands run, link related issues when available, and include screenshots for GUI layout changes.
 
 ## Security & Configuration Tips
 
-This app scrapes DART web pages rather than using the OpenDART API, so HTML changes can break regex parsing. Never fall back to the most recent document unless the requested round is verified. Do not commit downloaded PDFs, `issuers.json`, `state/`, build output, or local editor settings.
-Use the GUI's `DART 상태 확인` button before debugging matching logic when searches fail.
+Do not commit API keys, downloaded PDFs, cache data, or local runtime settings. Treat DART HTML as unstable: avoid broad fallback matching unless the requested product type, round, or ISIN has been verified.
