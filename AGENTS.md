@@ -1,80 +1,109 @@
 # Repository Guidelines
 
-## Agent Behavioral Guidelines (Karpathy-Inspired)
+## Operating Rules
 
-Based on `forrestchang/andrej-karpathy-skills`. These rules are meant to reduce common LLM coding mistakes. They bias toward caution over speed; use judgment for trivial one-line edits.
+These rules are meant to keep Codex/Claude work small, verifiable, and aligned
+with the current repository shape.
 
-### 1. Think Before Coding
+- Inspect the codebase and this file before editing.
+- Choose the smallest reasonable path when a choice is low-risk; ask only when
+  the choice changes behavior, data, credentials, or deployment.
+- Touch only files needed for the requested task. Do not clean adjacent code or
+  generated output opportunistically.
+- Preserve user changes in dirty worktrees. Do not revert unrelated edits.
+- Keep Korean UI/report strings readable UTF-8 text.
+- Define the verification command before changing behavior, then run the focused
+  tests or smoke checks that prove the change.
 
-Do not assume, hide confusion, or silently choose between plausible interpretations.
+## Canonical Root
 
-- State assumptions explicitly before implementing.
-- If multiple interpretations exist, present them and ask when the choice matters.
-- If a simpler approach exists, say so and explain the tradeoff.
-- If something is unclear, stop, name the ambiguity, and ask.
-
-### 2. Simplicity First
-
-Write the minimum code that solves the requested problem.
-
-- Do not add features beyond what was asked.
-- Do not add abstractions for single-use code.
-- Do not add configurability that was not requested.
-- Do not add error handling for impossible scenarios.
-- If a solution is growing from 50 lines to 200 lines, simplify before continuing.
-
-### 3. Surgical Changes
-
-Touch only what the request requires and clean up only the side effects of your own changes.
-
-- Do not improve adjacent code, comments, or formatting opportunistically.
-- Do not refactor code that is not broken.
-- Match existing style, even if you would normally choose another style.
-- Mention unrelated dead code or cleanup opportunities; do not delete them unless asked.
-- Remove imports, variables, or functions only when your change made them unused.
-
-Every changed line should trace directly to the user's request.
-
-### 4. Goal-Driven Execution
-
-Define verifiable success criteria and loop until they are met.
-
-- For validation work, write or identify invalid-input checks, then make them pass.
-- For bug fixes, reproduce the bug with a test or focused check, then fix it.
-- For refactors, verify behavior before and after the change when practical.
-
-For multi-step tasks, state a short plan with checks:
+The Git repository is:
 
 ```text
-1. [Step] -> verify: [check]
-2. [Step] -> verify: [check]
-3. [Step] -> verify: [check]
+C:\Devs\Dart\cathyleee02-prog-minus-clone
 ```
 
-## Project Structure & Module Organization
+`C:\Devs\Dart` is a workspace folder, not a Git repo. Treat files directly under
+that folder as scratch inputs or generated analysis artifacts unless a task
+explicitly says otherwise.
 
-This is a Python/Tkinter desktop utility for finding and downloading DART termsheet and issuance-result PDFs. `dart_auto.py` is a backward-compatible entry point; application code lives in `dart_app/`. Keep business logic in `dart_app/domain/`, DART and OpenDART clients in `dart_app/integrations/`, GUI code in `dart_app/ui/`, reusable file/PDF/text helpers in `dart_app/utils/`, and settings/state helpers in `dart_app/state.py`, `config.py`, and `runtime.py`. Unit tests are in `tests/`, with the current suite in `tests/test_matching.py`. Real-network verification lives in `tools/e2e_check.py`. Root assets include `kap_logo.png` and `dart_icon.ico`. Runtime output such as `cache/`, `state/`, `settings.json`, `issuers.json`, and `e2e_output/` should stay untracked.
+## Project Purpose
 
-## Build, Test, and Development Commands
+This is a Python desktop utility for KAP structured-product daily operations.
+Given Korean derivative bond/note tickers, it finds matching DART termsheet PDFs
+and optionally verifies issuance status via `증권발행실적보고서`.
 
-- `python -m pip install -r requirements.txt`: install runtime and packaging dependencies.
-- `python dart_auto.py`: launch the local Tkinter app.
-- `python -B -m unittest discover -s tests`: run unit tests without writing `.pyc` files.
-- `python -B tools/e2e_check.py`: run the DART end-to-end check and write sample downloads to `e2e_output/`.
-- `python -m PyInstaller --onefile --windowed --icon dart_icon.ico --add-data "kap_logo.png;." dart_auto.py`: build a Windows executable.
+## Entry Points
 
-## Coding Style & Naming Conventions
+- `python dart_qt.py`: launch the PySide6 UI. This is the newer UI surface.
+- `python -m dart_app.qt_app`: equivalent Qt launcher.
+- `python dart_auto.py`: launch the legacy Tkinter UI and preserve the old
+  `dart_auto` import surface.
 
-Use Python 3, 4-space indentation, UTF-8 source files, and `snake_case` for functions, variables, and modules. Use `PascalCase` for classes such as `Dart`, `OpenDart`, and `App`. Prefer small pure helpers in `dart_app/domain/`; keep Tkinter event handling and layout inside `dart_app/ui/`. Preserve the `dart_auto` compatibility surface when moving functions, because tests and tools import and patch `dart_auto` globals. Keep Korean UI/report strings readable and do not replace them with escaped text.
+Do not put new application behavior into `dart_auto.py`; it is only a
+compatibility shim.
 
-## Testing Guidelines
+## Module Map
 
-The project uses `unittest`. Name test files `test_<area>.py` and test methods `test_<behavior>`. Add focused tests for parsing, matching, result analysis, path generation, cache behavior, and settings normalization. Mock HTTP and PDF inputs in unit tests; reserve live DART access for `tools/e2e_check.py`. Run `python -B -m unittest discover -s tests` before opening a PR.
+- `dart_app/domain/`: parsing, issuer/round/product extraction, document
+  matching, result analysis. Keep business rules here.
+- `dart_app/integrations/`: DART web scraper and optional OpenDART API client.
+  Do not bypass DART pacing/circuit-breaker code.
+- `dart_app/services/`: UI-neutral seams such as `RecordWorkflow` and
+  `DartDocumentAccess`.
+- `dart_app/ui/`: legacy Tkinter adapter.
+- `dart_app/qt_app/`: PySide6 adapter, table model, and theme.
+- `dart_app/runtime.py`, `state.py`, `config.py`: runtime JSON, settings,
+  cache, resources, and defaults.
+- `dart_app/legacy.py`: compatibility adapter for tests/tools/user scripts that
+  still import and patch `dart_auto`.
+- `tests/`: `unittest` tests. Keep new tests in this style.
+- `tools/`: live or app-like smoke checks that may hit DART.
 
-## Commit & Pull Request Guidelines
+For domain vocabulary and invariants, read `CONTEXT.md`. For UI visual direction,
+read `DESIGN.md`.
 
-Recent history uses concise Conventional Commit prefixes, for example `feat: improve DART download workflow` and `chore: initial commit`. Continue with `feat:`, `fix:`, `docs:`, `test:`, or `chore:`. Pull requests should describe user-visible behavior, list test or e2e commands run, link related issues when available, and include screenshots for GUI layout changes.
+## Build, Test, And Development Commands
 
-## Security & Configuration Tips
+- `python -m pip install -r requirements.txt`
+- `python -B -m py_compile dart_auto.py dart_qt.py`
+- `python -B -m unittest discover -s tests`
+- `python dart_qt.py`
+- `python dart_auto.py`
+- `python -B tools/e2e_check.py`
+- `python -B tools/qt_live_check.py --status-only`
 
-Do not commit API keys, downloaded PDFs, cache data, or local runtime settings. Treat DART HTML as unstable: avoid broad fallback matching unless the requested product type, round, or ISIN has been verified.
+Live checks write to `e2e_output/` and may use network/API quota. Prefer unit
+tests unless the user asks for live validation or the bug is network-dependent.
+
+## Non-Negotiable DART Rules
+
+- Never fall back to the most recent DART document when round/product evidence
+  does not match.
+- Preserve product filtering: DLB/ELB, DLS/ELS, and SUB/후순위 must not cross.
+- Preserve longest-prefix issuer matching.
+- Keep `%PDF-` validation before caching/downstream parsing PDF bytes.
+- Keep `RESULT_SCAN_LIMIT` separate from `PDF_SCAN_LIMIT`.
+- `force_refresh` increases DART/OpenDART request volume; live validation must
+  mirror the real worker path when diagnosing speed or rate-limit behavior.
+
+## Runtime Files
+
+Keep these untracked:
+
+- `cache/`
+- `state/`
+- `settings.json`
+- `issuers.json`
+- `.env`
+- `e2e_output/`
+- `.ruff_cache/`
+- `__pycache__/`
+
+Do not commit API keys, downloaded PDFs, local settings, or production extracts.
+
+## Commit And PR Notes
+
+Use concise Conventional Commit prefixes such as `feat:`, `fix:`, `docs:`,
+`test:`, or `chore:`. PRs should describe user-visible behavior and list exact
+verification commands.

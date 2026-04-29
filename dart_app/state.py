@@ -115,6 +115,10 @@ def normalize_runtime_settings(data=None):
 def load_settings():
     data = load_json(config.SETTINGS_PATH, {}) or {}
     settings = normalize_runtime_settings(data)
+    if data.get("result_search_days") == 180:
+        settings["result_search_days"] = config.RESULT_SEARCH_DAYS
+    if data.get("result_scan_limit") == 50:
+        settings["result_scan_limit"] = config.RESULT_SCAN_LIMIT
     settings["save_root"] = str(normalize_save_root(data.get("save_root")))
     if data.get("opendart_api_key"):
         settings["opendart_api_key"] = normalize_api_key(data.get("opendart_api_key"))

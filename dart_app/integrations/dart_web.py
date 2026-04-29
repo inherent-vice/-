@@ -273,6 +273,8 @@ class Dart:
         html = html or ""
         dcm_no = None
         for pattern in (
+            r"viewDoc\(\s*['\"]\d{14}['\"]\s*,\s*['\"](\d{8})",
+            r"node\d+\[['\"]dcmNo['\"]\]\s*=\s*['\"](\d{8})",
             r"\bdcmNo\s*[:=]\s*['\"]?(\d{8})",
             r"\bdcm_no\s*[:=]\s*['\"]?(\d{8})",
             r"openPdfDownload\(\s*['\"]\d{14}['\"]\s*,\s*['\"](\d{8})",
@@ -286,10 +288,16 @@ class Dart:
             dcm_no = next((num for num in nums if not num.startswith("00")), None)
 
         titles = re.findall(
-            r"\.add\(\s*['\"][^'\"]*['\"]\s*,\s*['\"][^'\"]*['\"]\s*,\s*['\"]([^'\"]+)['\"]",
+            r"node\d+\[['\"]text['\"]\]\s*=\s*['\"]([^'\"]+)['\"]",
             html,
             flags=re.S,
         )
+        if not titles:
+            titles = re.findall(
+                r"\.add\(\s*['\"][^'\"]*['\"]\s*,\s*['\"][^'\"]*['\"]\s*,\s*['\"]([^'\"]+)['\"]",
+                html,
+                flags=re.S,
+            )
         if not titles:
             titles = [
                 item for item in re.findall(r"['\"]([^'\"]{8,})['\"]", html)

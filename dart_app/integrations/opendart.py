@@ -30,6 +30,21 @@ SECURITIES_ISSUER_ALIASES = {
     "하나증권": ["하나금융투자"],
     "하나금융투자": ["하나증권"],
 }
+COMPANY_ALIASES = {
+    "BNK금융": ["BNK금융지주"],
+    "BNK금융지주": ["BNK금융"],
+    "DGB금융지주": ["iM금융지주"],
+    "IBK기업은행": ["기업은행"],
+    "JB 우리캐피탈": ["제이비우리캐피탈"],
+    "JB우리캐피탈": ["제이비우리캐피탈"],
+    "KB금융": ["KB금융지주"],
+    "KB금융지주": ["KB금융"],
+    "중소기업은행": ["기업은행"],
+    "NH농협캐피탈": ["엔에이치농협캐피탈"],
+    "엔에이치농협캐피탈": ["NH농협캐피탈"],
+    "SKADVANCED": ["SK어드밴스드"],
+    "SK어드밴스드": ["SKADVANCED"],
+}
 
 
 def _read_json(path: Path, default):
@@ -66,7 +81,11 @@ def _strict_company_key(value: str) -> str:
 
 def _company_aliases(company: str) -> list[str]:
     company = clean_text(company)
-    aliases = [company, *SECURITIES_ISSUER_ALIASES.get(company, [])]
+    aliases = [
+        company,
+        *COMPANY_ALIASES.get(company, []),
+        *SECURITIES_ISSUER_ALIASES.get(company, []),
+    ]
     if company.startswith("KB"):
         aliases.append(company.replace("KB", "케이비", 1))
     if company.startswith("케이비"):
@@ -89,6 +108,8 @@ class OpenDart:
     _last_request_at = 0.0
     _market_lock = threading.Lock()
     _market_refreshed_keys: set[tuple[str, str, str]] = set()
+    _corp_codes_lock = threading.Lock()
+    _corp_codes_by_path: dict[str, list[dict]] = {}
 
     def __init__(self, api_key, cache_dir=None):
         self.api_key = str(api_key or "").strip()
@@ -136,48 +157,70 @@ class OpenDart:
             return self._corp_codes
 
         cache_path = self._corp_cache_path()
-        cached = _read_json(cache_path, None)
-        if cached is not None:
-            self._corp_codes = cached
-            return cached
+        try:
+            cache_key = str(cache_path.resolve())
+        except OSError:
+            cache_key = str(cache_path)
 
-        response = self._request("corpCode.xml")
-        rows = []
-        with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
-            names = zf.namelist()
-            if not names:
-                self._corp_codes = []
-                return []
-            xml_data = zf.read(names[0])
-        root = ElementTree.fromstring(xml_data)
-        for item in root.findall(".//list"):
-            rows.append({
-                "corp_code": clean_text(item.findtext("corp_code")),
-                "corp_name": clean_text(item.findtext("corp_name")),
-                "stock_code": clean_text(item.findtext("stock_code")),
-            })
-        _write_json(cache_path, rows)
-        self._corp_codes = rows
-        return rows
+        with self._corp_codes_lock:
+            cached_rows = self._corp_codes_by_path.get(cache_key)
+            if cached_rows is not None:
+                self._corp_codes = cached_rows
+                return cached_rows
+
+            cached = _read_json(cache_path, None)
+            if cached is not None:
+                self._corp_codes_by_path[cache_key] = cached
+                self._corp_codes = cached
+                return cached
+
+            response = self._request("corpCode.xml")
+            rows = []
+            with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
+                names = zf.namelist()
+                if names:
+                    xml_data = zf.read(names[0])
+                    root = ElementTree.fromstring(xml_data)
+                    for item in root.findall(".//list"):
+                        rows.append({
+                            "corp_code": clean_text(item.findtext("corp_code")),
+                            "corp_name": clean_text(item.findtext("corp_name")),
+                            "stock_code": clean_text(item.findtext("stock_code")),
+                        })
+            _write_json(cache_path, rows)
+            self._corp_codes_by_path[cache_key] = rows
+            self._corp_codes = rows
+            return rows
 
     def find_corp_code(self, company):
         target = clean_text(company)
         if not target:
             return None
-        normalized_target = _normalize_company(target)
+        rows = self._load_corp_codes()
+        aliases = _company_aliases(target)
+        strict_aliases = {_strict_company_key(alias) for alias in aliases if _strict_company_key(alias)}
+        normalized_targets = list(
+            dict.fromkeys(_normalize_company(alias) for alias in aliases if _normalize_company(alias))
+        )
+
+        for row in rows:
+            name = clean_text(row.get("corp_name"))
+            code = clean_text(row.get("corp_code"))
+            if name and code and (name in aliases or _strict_company_key(name) in strict_aliases):
+                return code
+
         fallback = None
-        for row in self._load_corp_codes():
+        for row in rows:
             name = clean_text(row.get("corp_name"))
             code = clean_text(row.get("corp_code"))
             if not name or not code:
                 continue
-            if name == target:
-                return code
             normalized_name = _normalize_company(name)
-            if normalized_name and normalized_name == normalized_target:
+            if normalized_name and normalized_name in normalized_targets:
                 return code
-            if normalized_name and normalized_target and (
+            if normalized_name and any(
                 normalized_name.startswith(normalized_target) or normalized_target.startswith(normalized_name)
+                for normalized_target in normalized_targets
             ):
                 fallback = fallback or code
         return fallback
@@ -302,7 +345,11 @@ class OpenDart:
 
         response = self._request("document.xml", params={"rcept_no": rcp_no})
         text = ""
-        with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(response.content))
+        except zipfile.BadZipFile:
+            return ""
+        with zf:
             for name in zf.namelist():
                 if not name.lower().endswith((".xml", ".html", ".htm")):
                     continue

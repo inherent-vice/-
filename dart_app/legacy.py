@@ -38,6 +38,7 @@ from dart_app.runtime import (
     cache_stats as _cache_stats,
     clear_cache as _clear_cache,
     load_json_cache,
+    prune_cache as _prune_cache,
     read_cache_bytes,
     read_cache_text,
     safe_cache_name,
@@ -49,7 +50,7 @@ from dart_app.runtime import (
 from dart_app.runtime import load_json as _load_json
 from dart_app.runtime import normalize_runtime_settings as _normalize_runtime_settings
 from dart_app.runtime import normalize_save_root as _normalize_save_root
-from dart_app.services.document_access import DartDocumentAccess
+from dart_app.services.document_access import DartDocumentAccess, RunDocumentCache
 from dart_app.services.http_guard import HttpGuard
 from dart_app.services.record_workflow import RecordWorkflow, RecordWorkflowOptions
 from dart_app.services.structured_bond_db import (
@@ -88,6 +89,8 @@ RESULT_SEARCH_DAYS = config.RESULT_SEARCH_DAYS
 INDEX_SCAN_LIMIT = config.INDEX_SCAN_LIMIT
 PDF_SCAN_LIMIT = config.PDF_SCAN_LIMIT
 RESULT_SCAN_LIMIT = config.RESULT_SCAN_LIMIT
+RESULT_BODY_SCAN_LIMIT = config.RESULT_BODY_SCAN_LIMIT
+RESULT_FRONT_TEXT_SCAN_LIMIT = config.RESULT_FRONT_TEXT_SCAN_LIMIT
 REQUEST_RETRIES = config.REQUEST_RETRIES
 RETRY_BACKOFF = config.RETRY_BACKOFF
 DOWNLOAD_WORKERS = config.DOWNLOAD_WORKERS
@@ -107,6 +110,8 @@ def _sync_config_from_globals():
         "INDEX_SCAN_LIMIT",
         "PDF_SCAN_LIMIT",
         "RESULT_SCAN_LIMIT",
+        "RESULT_BODY_SCAN_LIMIT",
+        "RESULT_FRONT_TEXT_SCAN_LIMIT",
         "REQUEST_RETRIES",
         "RETRY_BACKOFF",
         "DOWNLOAD_WORKERS",
@@ -212,6 +217,8 @@ def apply_runtime_settings(settings):
     globals()["INDEX_SCAN_LIMIT"] = runtime["index_scan_limit"]
     globals()["PDF_SCAN_LIMIT"] = runtime["pdf_scan_limit"]
     globals()["RESULT_SCAN_LIMIT"] = runtime["result_scan_limit"]
+    globals()["RESULT_BODY_SCAN_LIMIT"] = runtime["result_body_scan_limit"]
+    globals()["RESULT_FRONT_TEXT_SCAN_LIMIT"] = runtime["result_front_text_scan_limit"]
     globals()["REQUEST_RETRIES"] = runtime["request_retries"]
     globals()["RETRY_BACKOFF"] = runtime["retry_backoff"]
     globals()["DOWNLOAD_WORKERS"] = runtime["download_workers"]
@@ -220,12 +227,17 @@ def apply_runtime_settings(settings):
     globals()["CIRCUIT_COOLDOWN"] = runtime["circuit_cooldown"]
     globals()["SEARCH_CACHE_SECONDS"] = int(runtime["search_cache_hours"] * 3600)
     _sync_config_from_globals()
+    _sync_document_matching_settings()
     return runtime
 
 
 def load_settings():
     data = load_json(SETTINGS_PATH, {}) or {}
     settings = normalize_runtime_settings(data)
+    if data.get("result_search_days") == 180:
+        settings["result_search_days"] = RESULT_SEARCH_DAYS
+    if data.get("result_scan_limit") == 50:
+        settings["result_scan_limit"] = RESULT_SCAN_LIMIT
     settings["save_root"] = str(normalize_save_root(data.get("save_root")))
     if data.get("opendart_api_key"):
         settings["opendart_api_key"] = normalize_api_key(data.get("opendart_api_key"))
@@ -266,6 +278,10 @@ def clear_cache(kind="all"):
     return _clear_cache(CACHE_DIR, kind)
 
 
+def prune_cache(settings=None):
+    return _prune_cache(CACHE_DIR, settings or load_settings())
+
+
 class OpenDart(_opendart.OpenDart):
     def cache_dir(self):
         return CACHE_DIR
@@ -299,6 +315,8 @@ def _sync_document_matching_settings():
     document_matching.INDEX_SCAN_LIMIT = INDEX_SCAN_LIMIT
     document_matching.PDF_SCAN_LIMIT = PDF_SCAN_LIMIT
     document_matching.RESULT_SCAN_LIMIT = RESULT_SCAN_LIMIT
+    document_matching.RESULT_BODY_SCAN_LIMIT = RESULT_BODY_SCAN_LIMIT
+    document_matching.RESULT_FRONT_TEXT_SCAN_LIMIT = RESULT_FRONT_TEXT_SCAN_LIMIT
 
 
 def find_termsheet_document(*args, **kwargs):

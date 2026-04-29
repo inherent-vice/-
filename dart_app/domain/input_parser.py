@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import csv
 import re
 
 def parse_input_line(line):
-    line = line.strip()
+    line = line.strip().lstrip("\ufeff")
     if not line:
+        return None
+    delimited = _parse_delimited_input_line(line)
+    if delimited:
+        return delimited
+    if _is_header_line(line):
         return None
     parts = re.split(r"\s+", line, maxsplit=1)
     if len(parts) == 2:
@@ -13,6 +19,26 @@ def parse_input_line(line):
 
 def is_security_code(text):
     return bool(re.fullmatch(r"[A-Z]{2}[A-Z0-9]{10}", text.strip(), re.I))
+
+def _is_header_line(line):
+    compact = re.sub(r"\s+", "", line)
+    return "종목코드" in compact and "종목명" in compact
+
+def _parse_delimited_input_line(line):
+    if "\t" in line:
+        fields = next(csv.reader([line], delimiter="\t"))
+    elif "," in line:
+        fields = next(csv.reader([line]))
+    else:
+        return None
+    fields = [field.strip().lstrip("\ufeff") for field in fields]
+    if len(fields) < 2:
+        return None
+    if _is_header_line(" ".join(fields[:2])):
+        return None
+    if is_security_code(fields[0]) and fields[1]:
+        return fields[0], fields[1]
+    return None
 
 def parse_input_lines(lines):
     """

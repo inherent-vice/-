@@ -1,4 +1,6 @@
 import io
+import os
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -38,6 +40,20 @@ class ParsingTests(unittest.TestCase):
             ],
         )
 
+    def test_parse_input_lines_accepts_tsv_with_description(self):
+        lines = [
+            "종목코드\t종목명\tDescription",
+            "KR6105561F14\tKB금융조건부(상)13\t[공모] CMT5Y+1.25%, 30NC5Q",
+            "KR6HN0008746\t하나증권(DLB)2681\t[AquaEx/공모] CD91-CMT3M",
+        ]
+        self.assertEqual(
+            d.parse_input_lines(lines),
+            [
+                ("KR6105561F14", "KB금융조건부(상)13"),
+                ("KR6HN0008746", "하나증권(DLB)2681"),
+            ],
+        )
+
     def test_extract_round_keeps_sub_round(self):
         self.assertEqual(d.extract_round("미래에셋캐피탈134-1"), ("134-1", "134"))
 
@@ -52,12 +68,56 @@ class ParsingTests(unittest.TestCase):
     def test_product_type_detects_derivative_and_subordinated(self):
         self.assertEqual(d.extract_product_type("하나증권(DLB)2681"), "DLB")
         self.assertEqual(d.extract_product_type("교보증권(신종)12회"), "SUB")
+        self.assertEqual(d.extract_product_type("메리츠캐피탈신종자본증권 297"), "SUB")
+        self.assertEqual(d.extract_product_type("신한금융조건부(상)19(신종-영구-5콜)"), "SUB")
+        self.assertEqual(d.extract_product_type("KB금융조건부(상)13"), "SUB")
+        self.assertEqual(d.extract_product_type("에스케이인천석화신종2"), "SUB")
+        self.assertIsNone(d.extract_product_type("SKADVANCED신종TEST"))
+
+    def test_extract_round_handles_subordinated_names_from_public_sample(self):
+        self.assertEqual(d.extract_round("흥국화재23(후)"), ("23", "23"))
+        self.assertEqual(d.extract_round("메리츠증권13(신종)"), ("13", "13"))
+        self.assertEqual(d.extract_round("우리금융조건부(상)20(신종)"), ("20", "20"))
+        self.assertEqual(d.extract_round("기업은행 조건부(상)2508이(후)10A-12(사)"), ("12", "12"))
+        self.assertEqual(d.extract_round("우리은행조건부(상)2906이(후)10갑23(지)"), ("23", "23"))
+        self.assertEqual(d.extract_round("메리츠캐피탈신종자본증권 297"), ("297", "297"))
+        self.assertEqual(d.extract_round("한국투자금융지주신종자본증권 40"), ("40", "40"))
+        self.assertEqual(d.extract_round("신한금융조건부(상)19(신종-영구-5콜)"), ("19", "19"))
+        self.assertEqual(d.extract_round("농업금융채권(은행)2025-07이-A(신종)"), (None, None))
+        self.assertEqual(d.extract_round("KB금융조건부(상)13"), ("13", "13"))
+        self.assertEqual(d.extract_round("KB금융조건부(상)11-1"), ("11-1", "11"))
+        self.assertEqual(d.extract_round("기업은행 조건부(상)2602이(신)영A-02(사)"), ("2", "2"))
+        self.assertEqual(d.extract_round("우리은행조건부(상)2710이(신)영구5갑16"), ("16", "16"))
+        self.assertEqual(d.extract_round("산금 조건부(상)23후이1000-1128-1"), ("23", "23"))
+        self.assertEqual(d.extract_round("신한은행조건부(상)22-03이10갑(후)"), (None, None))
 
     def test_find_issuer_prefers_longest_prefix(self):
         self.assertEqual(
             d.find_issuer("미래에셋캐피탈134-1", d.DEFAULT_ISSUERS),
             ("미래에셋캐피탈", True),
         )
+
+    def test_enterprise_bank_maps_to_opendart_company_name(self):
+        self.assertEqual(d.DEFAULT_ISSUERS["기업은행"], "기업은행")
+        self.assertEqual(d.DEFAULT_ISSUERS["중소기업은행"], "기업은행")
+
+    def test_renamed_financial_groups_map_to_current_opendart_names(self):
+        self.assertEqual(d.DEFAULT_ISSUERS["DGB금융지주"], "iM금융지주")
+        self.assertEqual(d.DEFAULT_ISSUERS["iM금융지주"], "iM금융지주")
+        self.assertEqual(d.DEFAULT_ISSUERS["JB우리캐피탈"], "제이비우리캐피탈")
+
+    def test_product_brand_aliases_map_to_actual_issuers(self):
+        self.assertEqual(d.DEFAULT_ISSUERS["해피플러스"], "DB증권")
+        self.assertEqual(d.find_issuer("해피플러스(DLS)881", d.DEFAULT_ISSUERS), ("DB증권", True))
+        self.assertEqual(d.find_issuer("DB손보3(후)", d.DEFAULT_ISSUERS), ("DB손해보험", True))
+        self.assertEqual(d.find_issuer("롯데카드582-1", d.DEFAULT_ISSUERS), ("롯데카드", True))
+        self.assertEqual(d.find_issuer("씨제이 씨지브이신종자본증권 40", d.DEFAULT_ISSUERS), ("씨제이씨지브이", True))
+        self.assertEqual(d.find_issuer("풀무원 신종자본증권72", d.DEFAULT_ISSUERS), ("풀무원식품", True))
+        self.assertEqual(d.find_issuer("이마트신종자본증권 3", d.DEFAULT_ISSUERS), ("이마트", True))
+        self.assertEqual(d.find_issuer("한국투자금융지주신종자본증권 40", d.DEFAULT_ISSUERS), ("한국투자금융지주", True))
+        self.assertEqual(d.find_issuer("KB금융조건부(상)13", d.DEFAULT_ISSUERS), ("KB금융", True))
+        self.assertEqual(d.find_issuer("BNK금융 조건부(상)12", d.DEFAULT_ISSUERS), ("BNK금융지주", True))
+        self.assertEqual(d.find_issuer("H&F투자(DLB)5107", d.DEFAULT_ISSUERS), ("하나증권", True))
 
 
 class MatchingTests(unittest.TestCase):
@@ -94,6 +154,9 @@ class MatchingTests(unittest.TestCase):
             ("20260423000001", "증권발행실적보고서 제280회"),
         )
 
+    def test_round_match_does_not_treat_decimal_date_as_round(self):
+        self.assertFalse(d.round_in_exact("사업보고서 (2025.12)", "12", "12"))
+
     def test_match_termsheet_respects_product_keyword(self):
         pairs = [
             ("20260424000001", "일괄신고추가서류(기타파생결합증권) 제280회"),
@@ -103,6 +166,45 @@ class MatchingTests(unittest.TestCase):
             d.match_termsheet(pairs, "280", "280", "DLB"),
             ("20260423000001", "일괄신고추가서류(기타파생결합사채) 제280회", False),
         )
+
+    def test_termsheet_candidates_filters_non_termsheet_titles_for_dlb(self):
+        pairs = [
+            ("20260424000005", "정정 증권신고서 제280회"),
+            ("20260424000004", "증권발행실적보고서"),
+            ("20260424000003", "주요사항보고서"),
+            ("20260424000002", "투자설명서(일괄신고)"),
+            ("20260424000001", "일괄신고추가서류(기타파생결합사채) 제280회"),
+        ]
+        kept = [rcp for rcp, _title, _score in d.termsheet_candidates(pairs, "DLB")]
+        self.assertEqual(set(kept), {"20260424000002", "20260424000001"})
+
+    def test_termsheet_candidates_keeps_permissive_for_sub_product(self):
+        pairs = [
+            ("20260424000003", "유가증권신고서"),
+            ("20260424000002", "증권신고서(채무증권) 제5회"),
+            ("20260424000001", "일괄신고추가서류 신종자본증권"),
+        ]
+        kept = [rcp for rcp, _title, _score in d.termsheet_candidates(pairs, "SUB")]
+        self.assertEqual(len(kept), 3)
+
+    def test_termsheet_candidates_keeps_capital_debt_major_report_for_sub_product(self):
+        pairs = [
+            ("20260424000002", "주요사항보고서(자본으로인정되는채무증권발행결정)"),
+            ("20260424000001", "사업보고서 (2025.12)"),
+        ]
+
+        kept = [rcp for rcp, _title, _score in d.termsheet_candidates(pairs, "SUB")]
+
+        self.assertEqual(kept, ["20260424000002"])
+
+    def test_termsheet_candidates_filters_business_reports_for_sub_product(self):
+        pairs = [
+            ("20260424000003", "사업보고서 (2025.12)"),
+            ("20260424000002", "연결재무제표기준영업(잠정)실적(공정공시)"),
+            ("20260424000001", "증권신고서(채무증권) 제12회"),
+        ]
+        kept = [rcp for rcp, _title, _score in d.termsheet_candidates(pairs, "SUB")]
+        self.assertEqual(kept, ["20260424000001"])
 
     def test_classify_termsheet_candidate_scores_confirmed_match(self):
         candidate = d.classify_termsheet_candidate(
@@ -185,6 +287,8 @@ class FilePathTests(unittest.TestCase):
                     "opendart_api_key": " sample-key ",
                     "search_days": 120,
                     "result_search_days": 240,
+                    "result_body_scan_limit": 44,
+                    "result_front_text_scan_limit": 18,
                     "download_workers": 4,
                     "auto_result": False,
                     "force_refresh": True,
@@ -197,6 +301,8 @@ class FilePathTests(unittest.TestCase):
                 settings = d.load_settings()
                 self.assertEqual(settings["search_days"], 120)
                 self.assertEqual(settings["result_search_days"], 240)
+                self.assertEqual(settings["result_body_scan_limit"], 44)
+                self.assertEqual(settings["result_front_text_scan_limit"], 18)
                 self.assertEqual(settings["download_workers"], 4)
                 self.assertFalse(settings["auto_result"])
                 self.assertTrue(settings["force_refresh"])
@@ -205,6 +311,8 @@ class FilePathTests(unittest.TestCase):
                 self.assertFalse(settings["use_opendart"])
 
     def test_apply_runtime_settings_updates_globals(self):
+        import dart_app.domain.document_matching as document_matching
+
         old = d.load_settings()
         try:
             runtime = d.apply_runtime_settings({
@@ -212,14 +320,32 @@ class FilePathTests(unittest.TestCase):
                 "result_search_days": 62,
                 "download_workers": 2,
                 "search_cache_hours": 1,
+                "result_body_scan_limit": 11,
+                "result_front_text_scan_limit": 7,
             })
             self.assertEqual(runtime["search_days"], 31)
             self.assertEqual(d.SEARCH_DAYS, 31)
             self.assertEqual(d.RESULT_SEARCH_DAYS, 62)
             self.assertEqual(d.DOWNLOAD_WORKERS, 2)
             self.assertEqual(d.SEARCH_CACHE_SECONDS, 3600)
+            self.assertEqual(d.RESULT_BODY_SCAN_LIMIT, 11)
+            self.assertEqual(d.RESULT_FRONT_TEXT_SCAN_LIMIT, 7)
+            self.assertEqual(document_matching.RESULT_BODY_SCAN_LIMIT, 11)
+            self.assertEqual(document_matching.RESULT_FRONT_TEXT_SCAN_LIMIT, 7)
         finally:
             d.apply_runtime_settings(old)
+
+    def test_load_settings_upgrades_old_result_search_defaults(self):
+        with TemporaryDirectory() as tmp, patch.object(d, "SETTINGS_PATH", Path(tmp) / "settings.json"):
+            d.SETTINGS_PATH.write_text(
+                '{"result_search_days": 180, "result_scan_limit": 50}',
+                encoding="utf-8",
+            )
+
+            settings = d.load_settings()
+
+            self.assertEqual(settings["result_search_days"], d.RESULT_SEARCH_DAYS)
+            self.assertEqual(settings["result_scan_limit"], d.RESULT_SCAN_LIMIT)
 
     def test_runtime_presets_are_normalized(self):
         for preset in d.RUNTIME_PRESETS.values():
@@ -230,6 +356,14 @@ class FilePathTests(unittest.TestCase):
             self.assertIn("save_termsheet_pdf", normalized)
             self.assertIn("save_result_pdf", normalized)
             self.assertIn("use_opendart", normalized)
+            self.assertIn("cache_auto_prune", normalized)
+            self.assertIn("result_body_scan_limit", normalized)
+            self.assertIn("result_front_text_scan_limit", normalized)
+            self.assertGreaterEqual(normalized["cache_search_days"], 1)
+            self.assertGreaterEqual(normalized["cache_document_days"], 1)
+            self.assertGreaterEqual(normalized["cache_pdf_days"], 1)
+            self.assertGreaterEqual(normalized["result_body_scan_limit"], 1)
+            self.assertGreaterEqual(normalized["result_front_text_scan_limit"], 1)
 
     def test_clear_cache_removes_only_cache_children(self):
         with TemporaryDirectory() as tmp, patch.object(d, "CACHE_DIR", Path(tmp) / "cache"):
@@ -245,6 +379,51 @@ class FilePathTests(unittest.TestCase):
             self.assertEqual(removed, 1)
             self.assertFalse(search_dir.exists())
             self.assertTrue((other_dir / "sample.pdf").exists())
+
+    def test_cache_stats_reports_group_breakdown(self):
+        with TemporaryDirectory() as tmp, patch.object(d, "CACHE_DIR", Path(tmp) / "cache"):
+            files = {
+                d.CACHE_DIR / "dart_search" / "sample.json": b"search",
+                d.CACHE_DIR / "dart_index" / "sample.html": b"document",
+                d.CACHE_DIR / "dart_pdf" / "sample.pdf": b"pdf",
+                d.CACHE_DIR / "misc" / "sample.bin": b"other",
+            }
+            for path, data in files.items():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+
+            stats = d.cache_stats()
+
+            self.assertEqual(stats["files"], 4)
+            self.assertEqual(stats["groups"]["search"]["files"], 1)
+            self.assertEqual(stats["groups"]["document"]["files"], 1)
+            self.assertEqual(stats["groups"]["pdf"]["files"], 1)
+            self.assertEqual(stats["groups"]["other"]["files"], 1)
+
+    def test_prune_cache_removes_only_expired_group_files(self):
+        with TemporaryDirectory() as tmp, patch.object(d, "CACHE_DIR", Path(tmp) / "cache"):
+            old_search = d.CACHE_DIR / "dart_search" / "old.json"
+            new_search = d.CACHE_DIR / "dart_search" / "new.json"
+            old_document = d.CACHE_DIR / "dart_index" / "old.html"
+            old_pdf = d.CACHE_DIR / "dart_pdf" / "old.pdf"
+            for path in (old_search, new_search, old_document, old_pdf):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"cache")
+            old_time = time.time() - 10 * 86400
+            for path in (old_search, old_document, old_pdf):
+                os.utime(path, (old_time, old_time))
+
+            removed = d.prune_cache({
+                "cache_search_days": 7,
+                "cache_document_days": 7,
+                "cache_pdf_days": 30,
+            })
+
+            self.assertEqual(removed["files"], 2)
+            self.assertFalse(old_search.exists())
+            self.assertFalse(old_document.exists())
+            self.assertTrue(new_search.exists())
+            self.assertTrue(old_pdf.exists())
 
     def test_structured_bond_db_row_normalization_and_evidence(self):
         row = d.normalize_structured_bond_row({
@@ -288,6 +467,35 @@ class OpenDartTests(unittest.TestCase):
             self.assertEqual(client.find_corp_code("메리츠증권"), "00126380")
             self.assertEqual(calls, ["corpCode.xml"])
 
+    def test_find_corp_code_reuses_corp_codes_across_clients(self):
+        xml = """
+        <result>
+          <list><corp_code>00126380</corp_code><corp_name>메리츠증권</corp_name><stock_code>008560</stock_code></list>
+        </result>
+        """.encode("utf-8")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("CORPCODE.xml", xml)
+
+        class Response:
+            content = buf.getvalue()
+
+        with TemporaryDirectory() as tmp, patch.object(d, "CACHE_DIR", Path(tmp)):
+            calls = []
+
+            def fake_request(endpoint, **_kwargs):
+                calls.append(endpoint)
+                return Response()
+
+            first = d.OpenDart("key")
+            second = d.OpenDart("key")
+            first._request = fake_request
+            second._request = fake_request
+
+            self.assertEqual(first.find_corp_code("메리츠증권"), "00126380")
+            self.assertEqual(second.find_corp_code("메리츠증권"), "00126380")
+            self.assertEqual(calls, ["corpCode.xml"])
+
     def test_find_corp_code_uses_aliases(self):
         rows = [
             {"corp_code": "00161639", "corp_name": "메리츠종합금융", "stock_code": "012420"},
@@ -297,6 +505,40 @@ class OpenDartTests(unittest.TestCase):
         client._load_corp_codes = lambda: rows
 
         self.assertEqual(client.find_corp_code("메리츠증권"), "00161639")
+
+    def test_find_corp_code_prefers_exact_alias_before_loose_normalized_match(self):
+        rows = [
+            {"corp_code": "OLD", "corp_name": "케이비투자증권", "stock_code": ""},
+            {"corp_code": "HOLDING", "corp_name": "KB금융", "stock_code": "105560"},
+            {"corp_code": "KBSEC", "corp_name": "케이비증권", "stock_code": "003450"},
+        ]
+
+        client = d.OpenDart("key")
+        client._load_corp_codes = lambda: rows
+
+        self.assertEqual(client.find_corp_code("케이비증권"), "KBSEC")
+        self.assertEqual(client.find_corp_code("KB증권"), "KBSEC")
+
+    def test_find_corp_code_uses_non_securities_company_aliases(self):
+        rows = [
+            {"corp_code": "NHSEC", "corp_name": "NH농협증권", "stock_code": "016420"},
+            {"corp_code": "NHCAP", "corp_name": "엔에이치농협캐피탈", "stock_code": ""},
+            {"corp_code": "IBK", "corp_name": "기업은행", "stock_code": "024110"},
+            {"corp_code": "IM", "corp_name": "iM금융지주", "stock_code": "139130"},
+            {"corp_code": "JBW", "corp_name": "제이비우리캐피탈", "stock_code": ""},
+            {"corp_code": "BNKFG", "corp_name": "BNK금융지주", "stock_code": "138930"},
+            {"corp_code": "SKADV", "corp_name": "SK어드밴스드", "stock_code": ""},
+        ]
+
+        client = d.OpenDart("key")
+        client._load_corp_codes = lambda: rows
+
+        self.assertEqual(client.find_corp_code("NH농협캐피탈"), "NHCAP")
+        self.assertEqual(client.find_corp_code("중소기업은행"), "IBK")
+        self.assertEqual(client.find_corp_code("DGB금융지주"), "IM")
+        self.assertEqual(client.find_corp_code("JB우리캐피탈"), "JBW")
+        self.assertEqual(client.find_corp_code("BNK금융"), "BNKFG")
+        self.assertEqual(client.find_corp_code("SKADVANCED"), "SKADV")
 
     def test_opendart_search_returns_rcp_and_title_and_uses_cache(self):
         class Response:
@@ -399,6 +641,16 @@ class OpenDartTests(unittest.TestCase):
             self.assertIn("KR6KB00086G3", client.get_document_text("20260417000267"))
             self.assertEqual(calls, ["document.xml"])
 
+    def test_opendart_document_text_returns_empty_for_non_zip_error_response(self):
+        class Response:
+            content = b"<?xml version='1.0'?><result><status>014</status></result>"
+
+        with TemporaryDirectory() as tmp, patch.object(d, "CACHE_DIR", Path(tmp)):
+            client = d.OpenDart("key")
+            client._request = lambda *_args, **_kwargs: Response()
+
+            self.assertEqual(client.get_document_text("20260428000561"), "")
+
 
 class DartParserTests(unittest.TestCase):
     def test_parse_search_results_extracts_rcp_and_title(self):
@@ -440,6 +692,26 @@ class DartParserTests(unittest.TestCase):
         self.assertEqual(
             d.Dart.parse_doc_info(html),
             ("12345678", ["제280회 투자설명서"]),
+        )
+
+    def test_parse_doc_info_extracts_current_node_toc_format(self):
+        html = """
+        <script>
+        var node1 = {};
+        node1['text'] = "일괄신고추가서류";
+        node1['rcpNo'] = "20260428000515";
+        node1['dcmNo'] = "11350651";
+        node1['eleId'] = "1";
+        node1['offset'] = "778";
+        node1['length'] = "6597";
+        node1['dtd'] = "dart4.xsd";
+        treeData.push(node1);
+        viewDoc("20260428000515", "11350651", "1", "778", "6597", "dart4.xsd", "");
+        </script>
+        """
+        self.assertEqual(
+            d.Dart.parse_doc_info(html),
+            ("11350651", ["일괄신고추가서류"]),
         )
 
     def test_parse_viewer_params_extracts_initial_view_doc(self):
@@ -542,6 +814,27 @@ class TermsheetDocumentTests(unittest.TestCase):
         self.assertEqual(result.rcp_no, "20260424000001")
         self.assertEqual(result.pdf, b"%PDF-body")
 
+    def test_find_termsheet_document_uses_sub_capital_major_report_body(self):
+        pairs = [
+            ("20260427000741", "[기재정정]주요사항보고서(자본으로인정되는채무증권발행결정)"),
+            ("20260413002873", "증권발행실적보고서"),
+        ]
+
+        result = d.find_termsheet_document(
+            pairs,
+            "297",
+            "297",
+            "SUB",
+            lambda rcp: ("12345678", []),
+            lambda rcp, dcm: b"%PDF-sub",
+            lambda rcp, dcm: "메리츠캐피탈 제297회 신종자본증권 발행조건",
+            stock_name="메리츠캐피탈신종자본증권 297",
+        )
+
+        self.assertEqual(result.source, "body")
+        self.assertEqual(result.rcp_no, "20260427000741")
+        self.assertEqual(result.pdf, b"%PDF-sub")
+
     def test_find_termsheet_document_uses_opendart_text_identifier_before_index_scan(self):
         pairs = [
             ("20260424000002", "일괄신고추가서류(기타파생결합사채)"),
@@ -569,6 +862,66 @@ class TermsheetDocumentTests(unittest.TestCase):
         self.assertEqual(result.source, "identifier")
         self.assertEqual(result.rcp_no, "20260424000001")
         self.assertEqual(doc_calls, ["20260424000001"])
+
+    def test_find_termsheet_document_caps_opendart_identifier_prescan(self):
+        pairs = [
+            (f"202604240000{i:02d}", "일괄신고추가서류(기타파생결합사채)")
+            for i in range(20)
+        ]
+        text_calls = []
+
+        def document_text(rcp):
+            text_calls.append(rcp)
+            return ""
+
+        d.find_termsheet_document(
+            pairs,
+            "999",
+            "999",
+            "DLB",
+            lambda rcp: ("12345678", []),
+            lambda rcp, dcm: None,
+            lambda rcp, dcm: "",
+            get_document_text=document_text,
+            stock_code="KR6TEST00001",
+            stock_name="ABC(DLB)999",
+        )
+
+        self.assertEqual(len(text_calls), 12)
+
+    def test_find_termsheet_document_quick_body_scan_before_wide_index_scan(self):
+        pairs = [
+            (f"202604240000{i:02d}", "투자설명서(일괄신고)")
+            for i in range(20)
+        ]
+        doc_calls = []
+        front_calls = []
+
+        def doc_info(rcp):
+            doc_calls.append(rcp)
+            return "12345678", ["일괄신고추가서류"]
+
+        def front_text(rcp, dcm):
+            front_calls.append(rcp)
+            if rcp == "20260424000000":
+                return "ABC 제999회 기타파생결합사채 조건"
+            return ""
+
+        result = d.find_termsheet_document(
+            pairs,
+            "999",
+            "999",
+            "DLB",
+            doc_info,
+            lambda rcp, dcm: b"%PDF-body",
+            front_text,
+            stock_name="ABC(DLB)999",
+        )
+
+        self.assertEqual(result.source, "body")
+        self.assertEqual(result.rcp_no, "20260424000000")
+        self.assertEqual(doc_calls, ["20260424000000"])
+        self.assertEqual(front_calls, ["20260424000000"])
 
     def test_find_termsheet_document_does_not_fallback_to_newest_without_round(self):
         pairs = [
@@ -710,6 +1063,83 @@ class ResultAnalysisTests(unittest.TestCase):
         self.assertIn("납입금액", result.text)
         self.assertIsNone(result.pdf)
         self.assertEqual(pdf_calls, [])
+
+    def test_find_result_report_document_scores_identifier_and_amount_evidence(self):
+        pairs = [("20260424000001", "증권발행실적보고서 제280회")]
+
+        result = d.find_result_report_document(
+            pairs,
+            "280",
+            "280",
+            lambda rcp: ("12345678", ["증권발행실적보고서 제280회"]),
+            lambda rcp, dcm: b"%PDF-result",
+            lambda rcp, dcm: "KR6ABC000001 DLB 제280회 증권발행실적보고서 납입금액 : 10,000원",
+            stock_code="KR6ABC000001",
+            stock_name="ABC(DLB)280",
+            product="DLB",
+            need_pdf=False,
+        )
+
+        self.assertEqual(result.source, "identifier")
+        self.assertGreaterEqual(result.score, 300)
+        self.assertIn("종목코드 KR6ABC000001 본문 일치", result.evidence)
+        self.assertIn("발행금액/청약 결과 문구 확인", result.evidence)
+
+    def test_find_result_report_document_requires_exact_sub_round(self):
+        result = d.find_result_report_document(
+            [("20260424000001", "증권발행실적보고서 제280회")],
+            "280-1",
+            "280",
+            lambda rcp: ("12345678", ["증권발행실적보고서 제280회"]),
+            lambda rcp, dcm: b"%PDF-result",
+            lambda rcp, dcm: "DLB 제280회 증권발행실적보고서 납입금액 : 10,000원",
+            product="DLB",
+            need_pdf=False,
+        )
+
+        self.assertEqual(result.source, "not_found")
+        self.assertTrue(any("회차 280-1 불일치" in item.get("reject_reason", "") for item in result.candidates))
+
+    def test_find_result_report_document_accepts_exact_sub_round_body(self):
+        result = d.find_result_report_document(
+            [("20260424000001", "증권발행실적보고서")],
+            "280-1",
+            "280",
+            lambda rcp: ("12345678", ["증권발행실적보고서"]),
+            lambda rcp, dcm: b"%PDF-result",
+            lambda rcp, dcm: "DLB 제280회 제1차 증권발행실적보고서 납입금액 : 10,000원",
+            product="DLB",
+            stock_name="ABC(DLB)280-1",
+            need_pdf=False,
+        )
+
+        self.assertEqual(result.source, "body")
+        self.assertEqual(result.rcp_no, "20260424000001")
+
+    def test_find_result_report_document_prioritizes_result_title_before_body_scan(self):
+        calls = []
+
+        def document_text(rcp):
+            calls.append(rcp)
+            return "DLB 제280회 증권발행실적보고서 납입금액 : 10,000원"
+
+        result = d.find_result_report_document(
+            [
+                ("20260424000001", "기타 보고서 제280회"),
+                ("20260424000002", "증권발행실적보고서 제280회"),
+            ],
+            "280",
+            "280",
+            lambda rcp: ("12345678", ["증권발행실적보고서 제280회"]),
+            lambda rcp, dcm: b"%PDF-result",
+            lambda rcp, dcm: document_text(rcp),
+            get_document_text=document_text,
+            product="DLB",
+            need_pdf=False,
+        )
+
+        self.assertEqual(result.rcp_no, "20260424000002")
+        self.assertEqual(calls, ["20260424000002"])
 
     def test_find_result_report_document_respects_result_scan_limit(self):
         old_limit = d.RESULT_SCAN_LIMIT
@@ -888,6 +1318,78 @@ class DocumentAccessTests(unittest.TestCase):
         self.assertEqual(client.viewer_calls, [("20260424000001", "12345678")])
         self.assertEqual(client.pdf_calls, [])
         self.assertEqual(client.opendart.calls, [("20260424000001", True)])
+
+    def test_run_document_cache_reuses_values_across_access_instances(self):
+        class FakeOpenDart:
+            def __init__(self):
+                self.calls = []
+
+            def enabled(self):
+                return True
+
+            def get_document_text(self, rcp_no, force_refresh=False):
+                self.calls.append((rcp_no, force_refresh))
+                return f"document text {rcp_no}"
+
+        class FakeClient:
+            def __init__(self):
+                self.opendart = FakeOpenDart()
+                self.index_calls = []
+                self.viewer_calls = []
+                self.pdf_calls = []
+
+            def get_index_html(self, rcp_no):
+                self.index_calls.append(rcp_no)
+                return "index html"
+
+            def parse_doc_info(self, html):
+                return "12345678", ["제80회 투자설명서"]
+
+            def get_viewer_text_from_index(self, html, rcp_no, dcm_no):
+                self.viewer_calls.append((rcp_no, dcm_no))
+                return "viewer text"
+
+            def download_pdf(self, rcp_no, dcm_no):
+                self.pdf_calls.append((rcp_no, dcm_no))
+                return b"%PDF-1.7\ncontent"
+
+        shared = d.RunDocumentCache()
+        first = FakeClient()
+        second = FakeClient()
+        first_access = d.DartDocumentAccess(first, force_refresh=True, shared_cache=shared)
+        second_access = d.DartDocumentAccess(second, force_refresh=True, shared_cache=shared)
+
+        self.assertEqual(first_access.doc_info("20260424000001"), ("12345678", ["제80회 투자설명서"]))
+        self.assertEqual(second_access.doc_info("20260424000001"), ("12345678", ["제80회 투자설명서"]))
+        self.assertEqual(first_access.front_text("20260424000001", "12345678"), "viewer text")
+        self.assertEqual(second_access.front_text("20260424000001", "12345678"), "viewer text")
+        self.assertEqual(first_access.pdf_for("20260424000001", "12345678"), b"%PDF-1.7\ncontent")
+        self.assertEqual(second_access.pdf_for("20260424000001", "12345678"), b"%PDF-1.7\ncontent")
+        self.assertEqual(first_access.document_text("20260424000001"), "document text 20260424000001")
+        self.assertEqual(second_access.document_text("20260424000001"), "document text 20260424000001")
+
+        self.assertEqual(first.index_calls, ["20260424000001"])
+        self.assertEqual(second.index_calls, [])
+        self.assertEqual(first.pdf_calls, [("20260424000001", "12345678")])
+        self.assertEqual(second.pdf_calls, [])
+        self.assertEqual(first.opendart.calls, [("20260424000001", True)])
+        self.assertEqual(second.opendart.calls, [])
+
+    def test_run_document_cache_retries_after_failed_load(self):
+        calls = []
+        cache = d.RunDocumentCache()
+
+        def flaky():
+            calls.append(True)
+            if len(calls) == 1:
+                raise RuntimeError("temporary")
+            return "ok"
+
+        with self.assertRaises(RuntimeError):
+            cache.get_or_load("index", "20260424000001", flaky)
+
+        self.assertEqual(cache.get_or_load("index", "20260424000001", flaky), "ok")
+        self.assertEqual(len(calls), 2)
 
 
 if __name__ == "__main__":

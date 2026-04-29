@@ -83,6 +83,12 @@ def normalize_runtime_settings(data=None, defaults=None):
         "result_scan_limit": _coerce_int(
             merged.get("result_scan_limit"), defaults.get("result_scan_limit", 50), 1
         ),
+        "result_body_scan_limit": _coerce_int(
+            merged.get("result_body_scan_limit"), defaults.get("result_body_scan_limit", 40), 1
+        ),
+        "result_front_text_scan_limit": _coerce_int(
+            merged.get("result_front_text_scan_limit"), defaults.get("result_front_text_scan_limit", 20), 1
+        ),
         "request_retries": _coerce_int(
             merged.get("request_retries"), defaults.get("request_retries", 3), 1
         ),
@@ -104,6 +110,18 @@ def normalize_runtime_settings(data=None, defaults=None):
         "search_cache_hours": _coerce_float(
             merged.get("search_cache_hours"), defaults.get("search_cache_hours", 6), 0.0
         ),
+        "cache_auto_prune": _coerce_bool(
+            merged.get("cache_auto_prune"), defaults.get("cache_auto_prune", True)
+        ),
+        "cache_search_days": _coerce_int(
+            merged.get("cache_search_days"), defaults.get("cache_search_days", 14), 1, 3650
+        ),
+        "cache_document_days": _coerce_int(
+            merged.get("cache_document_days"), defaults.get("cache_document_days", 90), 1, 3650
+        ),
+        "cache_pdf_days": _coerce_int(
+            merged.get("cache_pdf_days"), defaults.get("cache_pdf_days", 30), 1, 3650
+        ),
         "auto_result": _coerce_bool(merged.get("auto_result"), defaults.get("auto_result", True)),
         "force_refresh": _coerce_bool(merged.get("force_refresh"), defaults.get("force_refresh", False)),
         "save_termsheet_pdf": _coerce_bool(
@@ -113,6 +131,9 @@ def normalize_runtime_settings(data=None, defaults=None):
             merged.get("save_result_pdf"), defaults.get("save_result_pdf", True)
         ),
         "use_opendart": _coerce_bool(merged.get("use_opendart"), defaults.get("use_opendart", True)),
+        "filter_termsheet_targets": _coerce_bool(
+            merged.get("filter_termsheet_targets"), defaults.get("filter_termsheet_targets", True)
+        ),
     }
 
     if "save_root" in merged:
@@ -191,17 +212,19 @@ def _safe_rmtree(root, target):
     return count
 
 
+CACHE_GROUP_PATHS = {
+    "search": ("dart_search", "opendart/search", "opendart_search", "opendart/market_filings"),
+    "document": ("dart_index", "dart_viewer", "opendart/document", "opendart_document"),
+    "pdf": ("dart_pdf",),
+}
+
+
 def clear_cache(cache_dir, kind="all"):
     root = Path(cache_dir)
     if not root.exists():
         return 0
 
-    groups = {
-        "search": ["dart_search", "opendart/search"],
-        "pdf": ["dart_pdf", "opendart/document"],
-        "document": ["opendart/document"],
-        "all": None,
-    }
+    groups = {**CACHE_GROUP_PATHS, "all": None}
     targets = groups.get(kind, groups["all"])
     if targets is None:
         paths = [child for child in root.iterdir()]
@@ -210,9 +233,100 @@ def clear_cache(cache_dir, kind="all"):
     return sum(_safe_rmtree(root, path) for path in paths if path.exists())
 
 
-def cache_stats(cache_dir):
+def _safe_unlink(root, target):
+    root = Path(root).resolve()
+    target = Path(target)
+    resolved = target.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        raise RuntimeError(f"Refusing to delete cache outside root: {resolved}")
+    size = target.stat().st_size if target.exists() else 0
+    target.unlink()
+    return size
+
+
+def _prune_empty_dirs(root, start):
+    root = Path(root).resolve()
+    start = Path(start)
+    if not start.exists() or not start.is_dir():
+        return
+    for directory in sorted((path for path in start.rglob("*") if path.is_dir()), reverse=True):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    try:
+        start.resolve().relative_to(root)
+        start.rmdir()
+    except OSError:
+        pass
+
+
+def prune_cache(cache_dir, settings=None, now=None):
     root = Path(cache_dir)
     if not root.exists():
         return {"files": 0, "bytes": 0}
-    files = [path for path in root.rglob("*") if path.is_file()]
-    return {"files": len(files), "bytes": sum(path.stat().st_size for path in files)}
+
+    normalized = normalize_runtime_settings(settings or {})
+    now_ts = now.timestamp() if hasattr(now, "timestamp") else dt.datetime.now().timestamp()
+    retention_days = {
+        "search": normalized["cache_search_days"],
+        "document": normalized["cache_document_days"],
+        "pdf": normalized["cache_pdf_days"],
+    }
+    removed = {"files": 0, "bytes": 0}
+    for group, relative_paths in CACHE_GROUP_PATHS.items():
+        cutoff = now_ts - (retention_days[group] * 86400)
+        for relative_path in relative_paths:
+            base = root / relative_path
+            if not base.exists():
+                continue
+            files = [base] if base.is_file() else [path for path in base.rglob("*") if path.is_file()]
+            for path in files:
+                try:
+                    if path.stat().st_mtime >= cutoff:
+                        continue
+                    removed["bytes"] += _safe_unlink(root, path)
+                    removed["files"] += 1
+                except FileNotFoundError:
+                    continue
+            _prune_empty_dirs(root, base)
+    return removed
+
+
+def cache_stats(cache_dir):
+    root = Path(cache_dir)
+    if not root.exists():
+        return {"files": 0, "bytes": 0, "groups": {}}
+    files = 0
+    total_bytes = 0
+    groups = {}
+    grouped_files = set()
+    for group, relative_paths in CACHE_GROUP_PATHS.items():
+        group_files = 0
+        group_bytes = 0
+        for relative_path in relative_paths:
+            base = root / relative_path
+            if not base.exists():
+                continue
+            paths = [base] if base.is_file() else [path for path in base.rglob("*") if path.is_file()]
+            for path in paths:
+                grouped_files.add(path.resolve())
+                group_files += 1
+                group_bytes += path.stat().st_size
+        groups[group] = {"files": group_files, "bytes": group_bytes}
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        files += 1
+        total_bytes += path.stat().st_size
+    other_files = 0
+    other_bytes = 0
+    for path in root.rglob("*"):
+        if not path.is_file() or path.resolve() in grouped_files:
+            continue
+        other_files += 1
+        other_bytes += path.stat().st_size
+    groups["other"] = {"files": other_files, "bytes": other_bytes}
+    return {"files": files, "bytes": total_bytes, "groups": groups}

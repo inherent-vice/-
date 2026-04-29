@@ -122,6 +122,8 @@ class SettingsDialog:
             ("index_scan_limit", "목차 탐색 개수", "검색 결과 중 목차까지 확인할 최대 개수"),
             ("pdf_scan_limit", "본문 탐색 개수", "PDF/뷰어 본문까지 확인할 최대 개수"),
             ("result_scan_limit", "발행실적 탐색 개수", "발행실적 후보 본문 탐색 범위"),
+            ("result_body_scan_limit", "발행실적 본문 확인", "OpenDART 본문까지 확인할 발행실적 후보 개수"),
+            ("result_front_text_scan_limit", "발행실적 PDF 확인", "PDF 앞부분까지 확인할 발행실적 후보 개수"),
         ),
         "속도/차단": (
             ("download_workers", "동시 작업 수", "발행사 그룹 병렬 처리 수"),
@@ -129,6 +131,11 @@ class SettingsDialog:
             ("http_min_interval", "요청 간격(초)", "DART 요청 사이 최소 대기 시간"),
             ("request_retries", "재시도 횟수", "일시적 연결 오류 재시도 횟수"),
             ("retry_backoff", "재시도 대기(초)", "재시도마다 증가하는 대기 시간"),
+        ),
+        "캐시 보관": (
+            ("cache_search_days", "검색 캐시 보관(일)", "디스크에 남은 검색 결과 캐시 보관 기간"),
+            ("cache_document_days", "문서 캐시 보관(일)", "목차/뷰어/OpenDART 문서 캐시 보관 기간"),
+            ("cache_pdf_days", "PDF 캐시 보관(일)", "내부 PDF 캐시 보관 기간"),
         ),
         "안전장치": (
             ("circuit_fail_limit", "차단 기준 실패 수", "연속 실패 시 잠시 우회/대기"),
@@ -179,13 +186,16 @@ class SettingsDialog:
         self.save_termsheet_pdf_var = tk.BooleanVar(value=bool(self.settings.get("save_termsheet_pdf", True)))
         self.save_result_pdf_var = tk.BooleanVar(value=bool(self.settings.get("save_result_pdf", True)))
         self.use_opendart_var = tk.BooleanVar(value=bool(self.settings.get("use_opendart", True)))
+        self.cache_auto_prune_var = tk.BooleanVar(value=bool(self.settings.get("cache_auto_prune", True)))
         self.bool_vars["auto_result"] = self.auto_result_var
         self.bool_vars["force_refresh"] = self.force_refresh_var
         self.bool_vars["save_termsheet_pdf"] = self.save_termsheet_pdf_var
         self.bool_vars["save_result_pdf"] = self.save_result_pdf_var
         self.bool_vars["use_opendart"] = self.use_opendart_var
+        self.bool_vars["cache_auto_prune"] = self.cache_auto_prune_var
         ttk.Checkbutton(options, text="텀싯 처리 후 발행실적보고서도 자동 확인", variable=self.auto_result_var).pack(side="left")
         ttk.Checkbutton(options, text="검색 캐시 무시하고 새로 조회", variable=self.force_refresh_var).pack(side="left", padx=16)
+        ttk.Checkbutton(options, text="오래된 캐시 자동 정리", variable=self.cache_auto_prune_var).pack(side="left")
 
         save_options = ttk.Frame(self.win)
         save_options.pack(fill="x", padx=14, pady=4)

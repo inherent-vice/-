@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +11,7 @@ from dart_app.domain.document_matching import find_result_report_document, find_
 from dart_app.domain.result_analysis import analyze_result_text
 from dart_app.domain.security_name import extract_product_type, extract_round, find_issuer
 from dart_app.models import ResultAnalysis
-from dart_app.services.document_access import DartDocumentAccess
+from dart_app.services.document_access import DartDocumentAccess, RunDocumentCache
 from dart_app.utils.files import output_pdf_path, stock_output_dir
 from dart_app.utils.pdf import analyze_result_pdf
 
@@ -37,6 +38,50 @@ class RecordContext:
     product: str | None
 
 
+class RunSearchCache:
+    """Execution-scoped DART search de-duplication.
+
+    `force_refresh=True` still refreshes the first request for a unique search
+    key, then reuses that fresh response for duplicate records in the same run.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._locks: dict[tuple[str, str, str, str, bool], threading.Lock] = {}
+        self._cache: dict[tuple[str, str, str, str, bool], tuple] = {}
+
+    def search(self, client, company, start, end, report_name="", force_refresh=False):
+        key = (str(company or ""), str(start or ""), str(end or ""), str(report_name or ""), bool(force_refresh))
+        with self._lock:
+            if key in self._cache:
+                return list(self._cache[key])
+            key_lock = self._locks.setdefault(key, threading.Lock())
+        with key_lock:
+            with self._lock:
+                if key in self._cache:
+                    return list(self._cache[key])
+            try:
+                value = tuple(
+                    client.search(
+                        company,
+                        start,
+                        end,
+                        report_name=report_name,
+                        force_refresh=force_refresh,
+                    )
+                    or []
+                )
+            except Exception:
+                with self._lock:
+                    if self._locks.get(key) is key_lock:
+                        self._locks.pop(key, None)
+                raise
+            with self._lock:
+                self._cache[key] = value
+                self._locks.pop(key, None)
+            return list(value)
+
+
 class RecordWorkflow:
     """Process one DART record behind a UI-neutral interface."""
 
@@ -48,6 +93,8 @@ class RecordWorkflow:
         update_record: Callable[..., None],
         should_stop: Callable[[], bool] | None = None,
         access_factory: Callable[..., DartDocumentAccess] = DartDocumentAccess,
+        search_cache: RunSearchCache | None = None,
+        document_cache: RunDocumentCache | None = None,
         today: dt.date | None = None,
     ):
         self.issuers = issuers
@@ -56,6 +103,8 @@ class RecordWorkflow:
         self.update_record = update_record
         self.should_stop = should_stop or (lambda: False)
         self.access_factory = access_factory
+        self.search_cache = search_cache or RunSearchCache()
+        self.document_cache = document_cache or RunDocumentCache()
         self.today = today or dt.date.today()
 
     def process_record(self, record):
@@ -64,8 +113,8 @@ class RecordWorkflow:
         result_start, _result_end = self._search_range(self.options.result_search_days)
 
         client = self.client_factory()
-        access = self.access_factory(client, force_refresh=self.options.force_refresh)
-        pairs = client.search(ctx.issuer, start, end, force_refresh=self.options.force_refresh)
+        access = self._make_access(client)
+        pairs = self.search_cache.search(client, ctx.issuer, start, end, force_refresh=self.options.force_refresh)
         self.update_record(ctx.stock_code, ctx.stock_name, status=f"검색 {len(pairs)}건")
 
         match = find_termsheet_document(
@@ -99,7 +148,8 @@ class RecordWorkflow:
         self.update_record(ctx.stock_code, ctx.stock_name, **updates)
 
         if self.options.auto_result and not self.should_stop():
-            result_pairs = client.search(
+            result_pairs = self.search_cache.search(
+                client,
                 ctx.issuer,
                 result_start,
                 end,
@@ -133,8 +183,9 @@ class RecordWorkflow:
         start, end = self._search_range(self.options.result_search_days)
 
         client = self.client_factory()
-        access = self.access_factory(client, force_refresh=self.options.force_refresh)
-        pairs = client.search(
+        access = self._make_access(client)
+        pairs = self.search_cache.search(
+            client,
             ctx.issuer,
             start,
             end,
@@ -160,6 +211,16 @@ class RecordWorkflow:
         self._save_result_pdf(ctx, result_match, updates)
         self.update_record(ctx.stock_code, ctx.stock_name, **updates)
         return ctx.stock_code, ctx.stock_name, bool(result_match.rcp_no)
+
+    def _make_access(self, client):
+        try:
+            return self.access_factory(
+                client,
+                force_refresh=self.options.force_refresh,
+                shared_cache=self.document_cache,
+            )
+        except TypeError:
+            return self.access_factory(client, force_refresh=self.options.force_refresh)
 
     def _record_context(self, record, status):
         stock_code, stock_name = record
@@ -215,12 +276,14 @@ def result_analysis_for_match(result_match):
         return analyze_result_text(result_match.text)
     if result_match.pdf:
         return analyze_result_pdf(result_match.pdf)
+    error = result_match.error or "발행실적보고서 미발견"
+    label = "발행실적 미확인" if ("찾지 못" in error or "미발견" in error) else "알 수 없음"
     return ResultAnalysis(
         "unknown",
-        "알 수 없음",
+        label,
         "낮음",
-        result_match.error or "발행실적보고서 미발견",
-        [result_match.error or "발행실적보고서 미발견"],
+        error,
+        [error],
         [],
     )
 

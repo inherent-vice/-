@@ -13,8 +13,9 @@ from tkinter import END, Text, Tk, filedialog, messagebox, ttk
 from dart_app import config, state
 from dart_app.domain.security_name import extract_product_type, extract_round, find_issuer
 from dart_app.integrations.dart_web import DART_BASE, Dart
-from dart_app.services.record_workflow import RecordWorkflow, RecordWorkflowOptions
-from dart_app.runtime import cache_stats, clear_cache
+from dart_app.services.document_access import RunDocumentCache
+from dart_app.services.record_workflow import RecordWorkflow, RecordWorkflowOptions, RunSearchCache
+from dart_app.runtime import cache_stats, clear_cache, prune_cache
 from dart_app.ui.dialogs import IssuerEditor, SettingsDialog
 from dart_app.utils.files import stock_output_dir
 from dart_app.domain.input_parser import parse_input_lines
@@ -62,6 +63,8 @@ class App:
         self._update_save_status()
         self._update_summary()
         self.refresh_cache_info()
+        if settings.get("cache_auto_prune", True):
+            self.root.after(1200, self._auto_prune_cache)
         self.root.after(80, self._drain_ui_queue)
 
     def apply_runtime_settings(self, settings):
@@ -71,6 +74,8 @@ class App:
         config.INDEX_SCAN_LIMIT = runtime["index_scan_limit"]
         config.PDF_SCAN_LIMIT = runtime["pdf_scan_limit"]
         config.RESULT_SCAN_LIMIT = runtime["result_scan_limit"]
+        config.RESULT_BODY_SCAN_LIMIT = runtime["result_body_scan_limit"]
+        config.RESULT_FRONT_TEXT_SCAN_LIMIT = runtime["result_front_text_scan_limit"]
         config.REQUEST_RETRIES = runtime["request_retries"]
         config.RETRY_BACKOFF = runtime["retry_backoff"]
         config.DOWNLOAD_WORKERS = runtime["download_workers"]
@@ -83,6 +88,8 @@ class App:
         document_matching.INDEX_SCAN_LIMIT = config.INDEX_SCAN_LIMIT
         document_matching.PDF_SCAN_LIMIT = config.PDF_SCAN_LIMIT
         document_matching.RESULT_SCAN_LIMIT = config.RESULT_SCAN_LIMIT
+        document_matching.RESULT_BODY_SCAN_LIMIT = config.RESULT_BODY_SCAN_LIMIT
+        document_matching.RESULT_FRONT_TEXT_SCAN_LIMIT = config.RESULT_FRONT_TEXT_SCAN_LIMIT
         return runtime
 
     def _build_ui(self):
@@ -246,7 +253,9 @@ class App:
         buttons = ttk.Frame(self.cache_tab)
         buttons.pack(anchor="w", pady=6)
         ttk.Button(buttons, text="새로고침", command=self.refresh_cache_info).pack(side="left")
+        ttk.Button(buttons, text="오래된 캐시 정리", command=self.prune_cache_ui).pack(side="left", padx=6)
         ttk.Button(buttons, text="검색 캐시 삭제", command=lambda: self.clear_cache_ui("search")).pack(side="left", padx=6)
+        ttk.Button(buttons, text="문서 캐시 삭제", command=lambda: self.clear_cache_ui("document")).pack(side="left")
         ttk.Button(buttons, text="PDF 캐시 삭제", command=lambda: self.clear_cache_ui("pdf")).pack(side="left")
         ttk.Button(buttons, text="전체 캐시 삭제", command=lambda: self.clear_cache_ui("all")).pack(side="left", padx=6)
 
@@ -760,7 +769,16 @@ class App:
             return Dart("")
         return Dart(self._opendart_api_key_value or state.discover_opendart_api_key())
 
-    def _make_workflow(self, save_root, save_termsheet_pdf, save_result_pdf, auto_result, force_refresh):
+    def _make_workflow(
+        self,
+        save_root,
+        save_termsheet_pdf,
+        save_result_pdf,
+        auto_result,
+        force_refresh,
+        search_cache=None,
+        document_cache=None,
+    ):
         options = RecordWorkflowOptions(
             save_root=save_root,
             search_days=config.SEARCH_DAYS,
@@ -776,25 +794,49 @@ class App:
             options,
             self.update_record,
             should_stop=self._stop_event.is_set,
+            search_cache=search_cache,
+            document_cache=document_cache,
         )
 
-    def _process_record(self, record, save_root, save_termsheet_pdf, save_result_pdf, auto_result, force_refresh):
+    def _process_record(
+        self,
+        record,
+        save_root,
+        save_termsheet_pdf,
+        save_result_pdf,
+        auto_result,
+        force_refresh,
+        search_cache=None,
+        document_cache=None,
+    ):
         workflow = self._make_workflow(
             save_root,
             save_termsheet_pdf=save_termsheet_pdf,
             save_result_pdf=save_result_pdf,
             auto_result=auto_result,
             force_refresh=force_refresh,
+            search_cache=search_cache,
+            document_cache=document_cache,
         )
         return workflow.process_record(record)
 
-    def _process_result_record(self, record, save_root, save_result_pdf, force_refresh):
+    def _process_result_record(
+        self,
+        record,
+        save_root,
+        save_result_pdf,
+        force_refresh,
+        search_cache=None,
+        document_cache=None,
+    ):
         workflow = self._make_workflow(
             save_root,
             save_termsheet_pdf=False,
             save_result_pdf=save_result_pdf,
             auto_result=False,
             force_refresh=force_refresh,
+            search_cache=search_cache,
+            document_cache=document_cache,
         )
         return workflow.process_result_record(record)
 
@@ -817,9 +859,19 @@ class App:
         failed = 0
         self._run_on_ui_thread(self._reset_progress, len(records), "발행실적")
         workers = max(1, int(config.DOWNLOAD_WORKERS))
+        search_cache = RunSearchCache()
+        document_cache = RunDocumentCache()
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(self._process_result_record, record, save_root, save_result_pdf, force_refresh): record
+                executor.submit(
+                    self._process_result_record,
+                    record,
+                    save_root,
+                    save_result_pdf,
+                    force_refresh,
+                    search_cache,
+                    document_cache,
+                ): record
                 for record in records
             }
             for future in as_completed(futures):
@@ -857,6 +909,8 @@ class App:
             self.log("처리할 종목이 없습니다.")
             return
         workers = max(1, int(config.DOWNLOAD_WORKERS))
+        search_cache = RunSearchCache()
+        document_cache = RunDocumentCache()
         self._run_on_ui_thread(self._reset_progress, len(records), "처리")
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
@@ -868,6 +922,8 @@ class App:
                     save_result_pdf,
                     auto_result,
                     force_refresh,
+                    search_cache,
+                    document_cache,
                 ): record
                 for record in records
             }
@@ -909,7 +965,20 @@ class App:
     def refresh_cache_info(self):
         stats = cache_stats(config.CACHE_DIR)
         mb = stats["bytes"] / (1024 * 1024)
-        self.cache_info_var.set(f"캐시 파일 {stats['files']}개 / {mb:.1f} MB / {config.CACHE_DIR}")
+        self.cache_info_var.set(
+            f"캐시 파일 {stats['files']}개 / {mb:.1f} MB / {self._cache_group_summary(stats)} / {config.CACHE_DIR}"
+        )
+
+    def _cache_group_summary(self, stats):
+        labels = {"search": "검색", "document": "문서", "pdf": "PDF", "other": "기타"}
+        parts = []
+        for key in ("search", "document", "pdf", "other"):
+            group = (stats.get("groups") or {}).get(key) or {}
+            files = int(group.get("files") or 0)
+            size_mb = float(group.get("bytes") or 0) / (1024 * 1024)
+            if files or size_mb:
+                parts.append(f"{labels[key]} {files}개/{size_mb:.1f} MB")
+        return ", ".join(parts) if parts else "구성 없음"
 
     def clear_cache_ui(self, kind):
         if not messagebox.askyesno("캐시 삭제", f"{kind} 캐시를 삭제할까요?", parent=self.root):
@@ -920,6 +989,29 @@ class App:
             self.log(f"캐시 삭제: {removed}개")
         except Exception as exc:
             messagebox.showerror("삭제 실패", str(exc), parent=self.root)
+
+    def prune_cache_ui(self):
+        try:
+            removed = prune_cache(config.CACHE_DIR, state.load_settings())
+            self.refresh_cache_info()
+            mb = removed["bytes"] / (1024 * 1024)
+            self.log(f"오래된 캐시 정리: {removed['files']}개 / {mb:.1f} MB")
+            messagebox.showinfo("캐시 정리", f"오래된 캐시 {removed['files']}개를 정리했습니다.", parent=self.root)
+        except Exception as exc:
+            messagebox.showerror("정리 실패", str(exc), parent=self.root)
+
+    def _auto_prune_cache(self):
+        try:
+            settings = state.load_settings()
+            if not settings.get("cache_auto_prune", True):
+                return
+            removed = prune_cache(config.CACHE_DIR, settings)
+            if removed["files"]:
+                mb = removed["bytes"] / (1024 * 1024)
+                self.refresh_cache_info()
+                self.log(f"자동 캐시 정리: {removed['files']}개 / {mb:.1f} MB")
+        except Exception as exc:
+            self.log(f"자동 캐시 정리 실패: {exc}")
 
     def _open_target(self, target, label):
         if not target:

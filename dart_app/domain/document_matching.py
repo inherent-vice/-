@@ -16,7 +16,11 @@ from dart_app.utils.text import clean_text
 
 INDEX_SCAN_LIMIT = 80
 PDF_SCAN_LIMIT = 80
-RESULT_SCAN_LIMIT = 50
+RESULT_SCAN_LIMIT = 120
+IDENTIFIER_SCAN_LIMIT = 12
+BODY_QUICK_SCAN_LIMIT = 12
+RESULT_BODY_SCAN_LIMIT = 40
+RESULT_FRONT_TEXT_SCAN_LIMIT = 20
 
 
 def termsheet_keywords(product):
@@ -26,7 +30,7 @@ def termsheet_keywords(product):
     if product in ("DLS", "ELS"):
         return common + [product, "기타파생결합증권", "파생결합증권"]
     if product == "SUB":
-        return common + ["신종자본증권", "조건부자본증권", "후순위"]
+        return common + ["신종자본증권", "조건부자본증권", "후순위", "주요사항보고서", "자본으로인정되는채무증권"]
     return common + ["파생결합", "증권신고서"]
 
 
@@ -46,12 +50,41 @@ def _product_score(title: str, product: str | None) -> int:
     return 0
 
 
+_TERMSHEET_TITLE_KEYWORDS = ("일괄신고추가서류", "투자설명서")
+_SUB_TERMSHEET_TITLE_KEYWORDS = (
+    "일괄신고추가서류",
+    "투자설명서",
+    "증권신고서",
+    "유가증권신고서",
+    "신종자본증권",
+    "조건부자본증권",
+    "후순위",
+    "주요사항보고서",
+    "자본으로인정되는채무증권",
+)
+_DERIVATIVE_PRODUCTS = {"DLB", "ELB", "DLS", "ELS"}
+
+
 def termsheet_candidates(pairs, product):
+    """Order DART search results into termsheet candidates.
+
+    For derivative bonds (DLB/ELB/DLS/ELS) the termsheet ALWAYS lives in either
+    `일괄신고추가서류(...)` or `투자설명서(...)`. Other titles (정정신고서,
+    증권신고서 본체, 첨부서류 등) are stripped here as a hard filter so wrong
+    PDFs cannot be picked up downstream — even if a stray round number happens
+    to appear in their body. SUB(신종) and unknown product keep the permissive
+    behavior since their termsheet titles vary.
+    """
+    strict = product in _DERIVATIVE_PRODUCTS
     candidates = []
     for order, (rcp, title) in enumerate(pairs):
-        score = 100 - order
         title_text = clean_text(title)
-        if _contains_any(title_text, ["일괄신고추가서류", "투자설명서", "증권신고서"]):
+        if strict and not _contains_any(title_text, _TERMSHEET_TITLE_KEYWORDS):
+            continue
+        if product == "SUB" and not _contains_any(title_text, _SUB_TERMSHEET_TITLE_KEYWORDS):
+            continue
+        score = 100 - order
+        if _contains_any(title_text, ["일괄신고추가서류", "투자설명서", "증권신고서", "주요사항보고서"]):
             score += 20
         score += _product_score(title_text, product)
         candidates.append((rcp, title, score))
@@ -272,9 +305,22 @@ def find_termsheet_document(
 ):
     candidates = termsheet_candidates(pairs, product)
     scored: list[DocumentCandidateScore] = []
+    doc_info_cache = {}
+    front_text_cache = {}
+
+    def doc_info_for(rcp):
+        if rcp not in doc_info_cache:
+            doc_info_cache[rcp] = _safe_doc_info(get_doc_info, rcp)
+        return doc_info_cache[rcp]
+
+    def front_text_for(rcp, dcm_no):
+        key = (rcp, dcm_no)
+        if key not in front_text_cache:
+            front_text_cache[key] = _safe_text(get_front_text, rcp, dcm_no)
+        return front_text_cache[key]
 
     if get_document_text and stock_code:
-        for rcp, title, priority in candidates[:PDF_SCAN_LIMIT]:
+        for rcp, title, priority in candidates[:min(PDF_SCAN_LIMIT, IDENTIFIER_SCAN_LIMIT)]:
             body = _safe_text(get_document_text, rcp)
             candidate = classify_termsheet_candidate(
                 rcp,
@@ -288,7 +334,7 @@ def find_termsheet_document(
                 stock_name=stock_name,
             )
             if candidate.grade == "확정" and candidate.source == "identifier":
-                dcm_no, titles, doc_error = _safe_doc_info(get_doc_info, rcp)
+                dcm_no, titles, doc_error = doc_info_for(rcp)
                 if doc_error:
                     scored.append(_reject(rcp, title, priority, "index", f"목차 조회 실패: {doc_error}"))
                     continue
@@ -314,14 +360,14 @@ def find_termsheet_document(
         candidate = classify_termsheet_candidate(rcp, title, priority, product, round_full, round_base)
         title_scored.append(candidate)
         if candidate.grade == "확정" and candidate.source == "title":
-            dcm_no, titles, doc_error = _safe_doc_info(get_doc_info, rcp)
+            dcm_no, titles, doc_error = doc_info_for(rcp)
             if doc_error:
                 title_scored.append(_reject(rcp, title, priority, "index", f"목차 조회 실패: {doc_error}"))
                 continue
             pdf = _download_pdf(download_pdf, rcp, dcm_no)
             fallback = False
             if not pdf:
-                body = _safe_text(get_front_text, rcp, dcm_no)
+                body = front_text_for(rcp, dcm_no)
                 pdf = _text_fallback_pdf(rcp, dcm_no, title, body)
                 fallback = bool(pdf)
                 _add_pdf_fallback_evidence(candidate, fallback)
@@ -339,9 +385,48 @@ def find_termsheet_document(
                 _candidate_dicts([candidate, *title_scored]),
             )
 
+    quick_body_scored = []
+    for rcp, title, priority in candidates[:min(PDF_SCAN_LIMIT, BODY_QUICK_SCAN_LIMIT)]:
+        dcm_no, titles, doc_error = doc_info_for(rcp)
+        if doc_error:
+            quick_body_scored.append(_reject(rcp, title, priority, "body", f"목차 조회 실패: {doc_error}"))
+            continue
+        if not dcm_no:
+            continue
+        body = front_text_for(rcp, dcm_no)
+        candidate = classify_termsheet_candidate(
+            rcp,
+            title,
+            priority,
+            product,
+            round_full,
+            round_base,
+            dcm_no=dcm_no,
+            titles=titles,
+            body=body,
+            stock_code=stock_code,
+            stock_name=stock_name,
+        )
+        quick_body_scored.append(candidate)
+        if candidate.grade == "확정" and candidate.source in ("body", "identifier"):
+            pdf, fallback = _pdf_or_text_fallback(download_pdf, rcp, dcm_no, title, body)
+            _add_pdf_fallback_evidence(candidate, fallback)
+            return TermsheetMatchResult(
+                rcp,
+                title,
+                dcm_no,
+                pdf,
+                candidate.source,
+                None if pdf else "PDF 응답 비정상",
+                candidate.score,
+                candidate.grade,
+                candidate.evidence,
+                _candidate_dicts([candidate, *title_scored, *quick_body_scored]),
+            )
+
     index_scored = []
     for rcp, title, priority in candidates[:INDEX_SCAN_LIMIT]:
-        dcm_no, titles, doc_error = _safe_doc_info(get_doc_info, rcp)
+        dcm_no, titles, doc_error = doc_info_for(rcp)
         if doc_error:
             index_scored.append(_reject(rcp, title, priority, "index", f"목차 조회 실패: {doc_error}"))
             continue
@@ -360,7 +445,7 @@ def find_termsheet_document(
             pdf = _download_pdf(download_pdf, rcp, dcm_no)
             fallback = False
             if not pdf:
-                body = _safe_text(get_front_text, rcp, dcm_no)
+                body = front_text_for(rcp, dcm_no)
                 pdf = _text_fallback_pdf(rcp, dcm_no, title, body)
                 fallback = bool(pdf)
                 _add_pdf_fallback_evidence(candidate, fallback)
@@ -374,18 +459,18 @@ def find_termsheet_document(
                 candidate.score,
                 candidate.grade,
                 candidate.evidence,
-                _candidate_dicts([candidate, *title_scored, *index_scored]),
+                _candidate_dicts([candidate, *title_scored, *quick_body_scored, *index_scored]),
             )
 
     body_scored = []
     for rcp, title, priority in candidates[:PDF_SCAN_LIMIT]:
-        dcm_no, titles, doc_error = _safe_doc_info(get_doc_info, rcp)
+        dcm_no, titles, doc_error = doc_info_for(rcp)
         if doc_error:
             body_scored.append(_reject(rcp, title, priority, "body", f"목차 조회 실패: {doc_error}"))
             continue
         if not dcm_no:
             continue
-        body = _safe_text(get_front_text, rcp, dcm_no)
+        body = front_text_for(rcp, dcm_no)
         candidate = classify_termsheet_candidate(
             rcp,
             title,
@@ -413,11 +498,11 @@ def find_termsheet_document(
                 candidate.score,
                 candidate.grade,
                 candidate.evidence,
-                _candidate_dicts([candidate, *title_scored, *index_scored, *body_scored]),
+                _candidate_dicts([candidate, *title_scored, *quick_body_scored, *index_scored, *body_scored]),
             )
 
     target = round_full or stock_code or "대상"
-    all_scores = title_scored or index_scored or body_scored or scored
+    all_scores = title_scored or quick_body_scored or index_scored or body_scored or scored
     return TermsheetMatchResult(
         None,
         None,
@@ -437,6 +522,44 @@ def _is_result_report_title(title):
     return "발행실적보고서" in compact
 
 
+_RESULT_AMOUNT_TERMS = (
+    "납입금액",
+    "발행금액",
+    "청약금액",
+    "배정금액",
+    "모집금액",
+    "청약 미달",
+    "발행 취소",
+    "발행이 취소",
+)
+
+
+def _has_result_amount_evidence(text):
+    text = clean_text(text)
+    if _contains_any(text, _RESULT_AMOUNT_TERMS):
+        return True
+    return bool(re.search(r"(납입|발행|청약|배정).{0,12}[0-9,]+ ?원", text))
+
+
+def _result_round_matches(text, round_full, round_base):
+    if not round_full:
+        return False
+    if "-" in str(round_full):
+        return round_in_exact(text, round_full, round_base)
+    return round_in(text, round_full, round_base)
+
+
+def _result_report_candidates(pairs):
+    candidates = []
+    for order, (rcp, title) in enumerate(pairs):
+        score = 100 - order
+        if _is_result_report_title(title):
+            score += 30
+        candidates.append((rcp, title, score))
+    candidates.sort(key=lambda item: item[2], reverse=True)
+    return candidates
+
+
 def match_result(pairs, round_full, round_base):
     for rcp, title in pairs:
         if not _is_result_report_title(title):
@@ -450,28 +573,70 @@ def _classify_result_candidate(rcp, title, priority, round_full, round_base, dcm
     title = clean_text(title)
     titles = [clean_text(item) for item in (titles or []) if clean_text(item)]
     body = clean_text(body)
-    combined = " ".join([title, *titles, body])
+    report_index_title = next((doc_title for doc_title in titles if _is_result_report_title(doc_title)), "")
+    report_in_title = _is_result_report_title(title)
+    report_in_body = bool(body and _is_result_report_title(body))
 
-    if not _is_result_report_title(combined):
+    if not (report_in_title or report_index_title or report_in_body):
         return _reject(rcp, title, priority, "title", "발행실적보고서 아님", dcm_no=dcm_no)
 
-    if stock_code and identifier_in_text(body, stock_code):
-        return _confirmed(rcp, title, 160 + int(priority or 0), "identifier", dcm_no=dcm_no, evidence=[f"종목코드 {stock_code} 본문 일치"], grade="검토필요")
+    score = int(priority or 0)
+    evidence = []
+    source = "title"
+    if report_in_title:
+        score += 45
+        evidence.append("증권발행실적보고서 제목 확인")
+    elif report_index_title:
+        score += 35
+        source = "index"
+        evidence.append(f"증권발행실적보고서 목차 확인: {report_index_title}")
+    else:
+        score += 25
+        source = "body"
+        evidence.append("증권발행실적보고서 본문 확인")
 
+    if body and _has_result_amount_evidence(body):
+        score += 20
+        evidence.append("발행금액/청약 결과 문구 확인")
+
+    identifier_match = bool(stock_code and identifier_in_text(body, stock_code))
+    if identifier_match:
+        score += 90
+        source = "identifier"
+        evidence.append(f"종목코드 {stock_code} 본문 일치")
+
+    round_source = ""
     if round_full:
-        if round_in(title, round_full, round_base):
-            return _confirmed(rcp, title, 130 + int(priority or 0), "title", dcm_no=dcm_no, evidence=[f"회차 {round_full} 제목 일치"], grade="검토필요")
+        if _result_round_matches(title, round_full, round_base):
+            score += 80
+            round_source = "title"
+            evidence.append(f"회차 {round_full} 제목 일치")
         for doc_title in titles:
-            if round_in(doc_title, round_full, round_base):
-                return _confirmed(rcp, title, 120 + int(priority or 0), "index", dcm_no=dcm_no, evidence=[f"회차 {round_full} 문서목차 일치"], grade="검토필요")
-        if body and (
+            if not round_source and _result_round_matches(doc_title, round_full, round_base):
+                score += 70
+                round_source = "index"
+                evidence.append(f"회차 {round_full} 문서목차 일치")
+        if not round_source and body and (
             product_round_in_text(body, round_full, product, stock_name)
-            or round_in(body, round_full, round_base)
+            or _result_round_matches(body, round_full, round_base)
         ):
-            return _confirmed(rcp, title, 115 + int(priority or 0), "body", dcm_no=dcm_no, evidence=[f"회차 {round_full} 본문 일치"], grade="검토필요")
-        return _reject(rcp, title, priority, "title", f"회차 {round_full} 불일치", dcm_no=dcm_no)
+            score += 65
+            round_source = "body"
+            evidence.append(f"회차 {round_full} 본문 일치")
+        if not identifier_match and not round_source:
+            return _reject(
+                rcp,
+                title,
+                score,
+                source,
+                f"회차 {round_full} 불일치",
+                dcm_no=dcm_no,
+                evidence=evidence,
+            )
+        if round_source and not identifier_match:
+            source = round_source
 
-    return _confirmed(rcp, title, 80 + int(priority or 0), "title", dcm_no=dcm_no, evidence=["발행실적보고서 제목 일치"], grade="검토필요")
+    return _confirmed(rcp, title, score, source, dcm_no=dcm_no, evidence=evidence, grade="검토필요")
 
 
 def find_result_report_document(
@@ -488,7 +653,7 @@ def find_result_report_document(
     need_pdf=False,
     log=None,
 ):
-    candidates = [(rcp, title, 100 - order) for order, (rcp, title) in enumerate(pairs)]
+    candidates = _result_report_candidates(pairs)
     scored: list[DocumentCandidateScore] = []
 
     for rcp, title, priority in candidates:
@@ -500,13 +665,29 @@ def find_result_report_document(
                 scored.append(_reject(rcp, title, priority, "index", f"목차 조회 실패: {doc_error}"))
                 continue
             body = _result_body_text(get_document_text, get_front_text, rcp, dcm_no)
+            candidate = _classify_result_candidate(
+                rcp,
+                title,
+                priority,
+                round_full,
+                round_base,
+                dcm_no=dcm_no,
+                titles=titles,
+                body=body,
+                product=product,
+                stock_code=stock_code,
+                stock_name=stock_name,
+            )
+            scored.append(candidate)
+            if candidate.grade == "제외":
+                continue
             pdf = _download_pdf(download_pdf, rcp, dcm_no) if need_pdf else None
             fallback = False
             if need_pdf and not pdf:
                 pdf = _text_fallback_pdf(rcp, dcm_no, title, body)
                 fallback = bool(pdf)
                 _add_pdf_fallback_evidence(candidate, fallback)
-            return ResultReportMatch(rcp, title, dcm_no, pdf, body, "title", None, candidate.score, candidate.grade, candidate.evidence, _candidate_dicts([candidate, *scored]))
+            return ResultReportMatch(rcp, title, dcm_no, pdf, body, candidate.source, None, candidate.score, candidate.grade, candidate.evidence, _candidate_dicts([candidate, *scored]))
 
     for rcp, title, priority in candidates[:INDEX_SCAN_LIMIT]:
         dcm_no, titles, doc_error = _safe_doc_info(get_doc_info, rcp)
@@ -526,16 +707,32 @@ def find_result_report_document(
         scored.append(candidate)
         if candidate.grade != "제외" and candidate.source == "index":
             body = _result_body_text(get_document_text, get_front_text, rcp, dcm_no)
+            candidate = _classify_result_candidate(
+                rcp,
+                title,
+                priority,
+                round_full,
+                round_base,
+                dcm_no=dcm_no,
+                titles=titles,
+                body=body,
+                product=product,
+                stock_code=stock_code,
+                stock_name=stock_name,
+            )
+            scored.append(candidate)
+            if candidate.grade == "제외":
+                continue
             pdf = _download_pdf(download_pdf, rcp, dcm_no) if need_pdf else None
             fallback = False
             if need_pdf and not pdf:
                 pdf = _text_fallback_pdf(rcp, dcm_no, title, body)
                 fallback = bool(pdf)
                 _add_pdf_fallback_evidence(candidate, fallback)
-            return ResultReportMatch(rcp, title, dcm_no, pdf, body, "index", None, candidate.score, candidate.grade, candidate.evidence, _candidate_dicts([candidate, *scored]))
+            return ResultReportMatch(rcp, title, dcm_no, pdf, body, candidate.source, None, candidate.score, candidate.grade, candidate.evidence, _candidate_dicts([candidate, *scored]))
 
     if get_document_text:
-        for rcp, title, priority in candidates[:RESULT_SCAN_LIMIT]:
+        for rcp, title, priority in candidates[:min(RESULT_SCAN_LIMIT, RESULT_BODY_SCAN_LIMIT)]:
             body = _safe_text(get_document_text, rcp)
             candidate = _classify_result_candidate(
                 rcp,
@@ -561,7 +758,7 @@ def find_result_report_document(
                 candidate.dcm_no = dcm_no
                 return ResultReportMatch(rcp, title, dcm_no, pdf, body, candidate.source, None, candidate.score, candidate.grade, candidate.evidence, _candidate_dicts([candidate, *scored]))
 
-    for rcp, title, priority in candidates[:RESULT_SCAN_LIMIT]:
+    for rcp, title, priority in candidates[:min(RESULT_SCAN_LIMIT, RESULT_FRONT_TEXT_SCAN_LIMIT)]:
         dcm_no, titles, doc_error = _safe_doc_info(get_doc_info, rcp)
         if doc_error:
             scored.append(_reject(rcp, title, priority, "body", f"목차 조회 실패: {doc_error}"))

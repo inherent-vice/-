@@ -39,6 +39,11 @@ def _normalize_round_value(value):
 def extract_round(stock_name):
     """종목명 안의 회차. '134-1', '제339호', 'DLB 339 공모'를 모두 처리."""
     s = normalize_stock_name_text(stock_name)
+    product_type = extract_product_type(stock_name)
+    if product_type == "SUB":
+        sub_round = _extract_sub_round(s)
+        if sub_round:
+            return (sub_round, sub_round.split("-")[0])
     token = r"(\d{1,5}(?:\s*-\s*\d{1,3})?)"
     product = r"(?:\((?:DLB|DLS|ELB|ELS)\)|(?<![A-Za-z])(?:DLB|DLS|ELB|ELS)(?![A-Za-z]))"
     patterns = [
@@ -58,10 +63,53 @@ def extract_round(stock_name):
     if not matches:
         return (None, None)
     full = matches[-1][1]
-    if extract_product_type(stock_name) in ("DLB", "DLS", "ELB", "ELS") and re.fullmatch(r"20\d{2}-\d{1,4}", full):
+    if product_type in ("DLB", "DLS", "ELB", "ELS") and re.fullmatch(r"20\d{2}-\d{1,4}", full):
         return (None, None)
     base = full.split("-")[0]
     return (full, base)
+
+
+def _extract_sub_round(stock_name):
+    """신종/후순위 종목명 회차 추출.
+
+    공모 신종자본증권은 `흥국화재23(후)`처럼 회차가 상품표시 앞에
+    붙거나 `...(후)10A-12(사)`처럼 상품표시 뒤 보조 코드 끝에 붙는다.
+    """
+    markers = list(re.finditer(r"조건부(?:\([^\)]*\))?|\((?:[^\)]*신종[^\)]*|[^\)]*후[^\)]*)\)|신종자본증권|신종(?=\s*\d|[-\s])|조건부자본증권|후순위", stock_name))
+    for marker in markers:
+        before = stock_name[: marker.start()]
+        immediate_before = re.search(r"(\d{1,5})\s*$", before)
+        if immediate_before:
+            value = _normalize_round_value(immediate_before.group(1))
+            if value and not re.fullmatch(r"20\d{2}", value):
+                return value
+
+        after = stock_name[marker.end() :]
+        after_round = _sub_round_after_marker(after)
+        if after_round:
+            return after_round
+    return None
+
+
+def _sub_round_after_marker(after):
+    """조건부자본증권 코드 뒤의 회차만 보수적으로 추출한다."""
+    text = clean_text(after)
+    if not text:
+        return None
+
+    simple = re.match(r"\s*(\d{1,3}(?:\s*-\s*\d{1,2})?)\s*(?:회|$|\()", text)
+    if simple:
+        return _normalize_round_value(simple.group(1))
+
+    leading_sub = re.match(r"\s*(\d{1,3})(?:이\s*\([^\)]*후[^\)]*\)|후이)", text)
+    if leading_sub:
+        return _normalize_round_value(leading_sub.group(1))
+
+    tail = re.sub(r"\([^\)]*\)\s*$", "", text).strip()
+    tail_match = re.search(r"(?:후|영신-?|영[A-Z]?-?|A-?|갑)(\d{1,3})(?:[가-힣A-Za-z]*)?$", tail, flags=re.I)
+    if tail_match and re.search(r"신|영|후", tail):
+        return _normalize_round_value(tail_match.group(1))
+    return None
 
 def find_issuer(stock_name, issuers):
     """
@@ -97,8 +145,13 @@ def find_issuer(stock_name, issuers):
     return (None, False)
 
 def is_subordinated(stock_name):
-    """(신종) 또는 (후) 포함 → 신종자본증권."""
-    return bool(re.search(r"\((신종|후[^\)]*)\)", stock_name))
+    """신종/후순위/조건부자본증권 표기 → 신종자본증권."""
+    text = clean_text(stock_name)
+    if any(marker in text for marker in ("신종자본증권", "조건부자본증권", "후순위", "조건부")):
+        return True
+    if re.search(r"신종(?=\s*\d|[-\s])", text):
+        return True
+    return bool(re.search(r"\((?:[^\)]*신종[^\)]*|[^\)]*후[^\)]*)\)", text))
 
 def extract_product_type(stock_name):
     """종목명 괄호에서 상품유형 추출. DLB/ELB/DLS/ELS/SUB(신종·후)/None."""
@@ -117,11 +170,11 @@ def round_in(text, full, base):
     if not full:
         return False
     t = re.sub(r"(?<=\d),(?=\d)", "", text)  # 매칭용으로만 쉼표 제거
-    if re.search(rf"(?<![\d\-]){re.escape(full)}(?!\d)", t):
+    if re.search(rf"(?<![\d\-.]){re.escape(full)}(?![\d.])", t):
         return True
     if base and base != full:
         # 앞: 숫자/하이픈 아닌 것,  뒤: 숫자 아닌 것 (하이픈 허용 → '280-1'도 OK)
-        if re.search(rf"(?<![\d\-]){re.escape(base)}(?!\d)", t):
+        if re.search(rf"(?<![\d\-.]){re.escape(base)}(?![\d.])", t):
             return True
     return False
 
@@ -138,7 +191,7 @@ def round_in_exact(text, full, base=None):
     t = _normalize_round_text(text)
     full = str(full).strip()
     if "-" not in full:
-        return bool(re.search(rf"(?<![\d\-]){re.escape(full)}(?!\d)", t))
+        return bool(re.search(rf"(?<![\d\-.]){re.escape(full)}(?![\d.])", t))
 
     parts = full.split("-", 1)
     if not parts[0] or not parts[1]:
